@@ -181,6 +181,9 @@ def list_all_workspaces() -> list[dict]:
             continue
         try:
             data = json.loads(ws_json.read_text())
+            folder_uri = data.get("folder", "") or data.get("workspace", "")
+            if not folder_uri:
+                continue
 
             ws_type = "local"
             host = None
