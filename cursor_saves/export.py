@@ -318,20 +318,31 @@ def _trim_message_contexts(contexts: dict[str, Any], max_size_bytes: int) -> dic
     return trimmed
 
 
-def _extract_agent_blob_ids(conv_data: dict) -> set[str]:
-    """Extract agentKv blob IDs referenced by a conversation.
+# Printable-ASCII range, used to reject 32-byte fields that are really
+# text (e.g. b"file:///home/booth/git/pyqtgraph" is exactly 32 bytes and
+# would otherwise be mistaken for a blob ID). A genuine 32-byte blob hash
+# is random binary, so being entirely printable ASCII is a reliable signal
+# that a candidate is a path/URI rather than a real reference.
+_PRINTABLE_ASCII = frozenset(range(0x20, 0x7F))
 
-    The composerData.conversationState field is a base64-encoded protobuf
-    prefixed with '~'. It contains 32-byte blob IDs at multiple protobuf
-    field numbers (1, 3, 8, 13, etc.) with wire type 2 (length-delimited).
-    These reference agentKv:blob:{hex} entries in cursorDiskKV.
+
+def _parse_cs_blob_ids(cs) -> set[str]:
+    """Parse 32-byte agentKv blob IDs from a conversationState protobuf.
+
+    ``cs`` is the ``~``-prefixed base64 string stored in either
+    ``composerData.conversationState`` or a bubble's ``conversationState``.
+    It contains 32-byte blob IDs at multiple protobuf field numbers
+    (1, 3, 8, 13, etc.) with wire type 2 (length-delimited), referencing
+    ``agentKv:blob:{hex}`` entries in cursorDiskKV.
 
     Uses proper protobuf wire format parsing (varint tags + length
-    prefixes) rather than naive byte scanning to avoid phantom matches.
+    prefixes) and skips 32-byte fields that are pure printable ASCII to
+    avoid phantom matches on embedded file URIs / paths.
     """
     import base64
 
-    cs = conv_data.get("conversationState", "")
+    if isinstance(cs, bytes):
+        cs = cs.decode("utf-8", "ignore")
     if not cs or not isinstance(cs, str) or not cs.startswith("~") or len(cs) < 10:
         return set()
 
@@ -362,7 +373,9 @@ def _extract_agent_blob_ids(conv_data: dict) -> set[str]:
         if wire_type == 2 and next_i < end:
             length, data_start = _read_varint(raw, next_i)
             if length == 32 and data_start + 32 <= end:
-                blob_ids.add(raw[data_start : data_start + 32].hex())
+                cand = raw[data_start : data_start + 32]
+                if not all(b in _PRINTABLE_ASCII for b in cand):
+                    blob_ids.add(cand.hex())
                 i = data_start + 32
             elif length > 0 and data_start + length <= end:
                 i = data_start + length
@@ -380,11 +393,54 @@ def _extract_agent_blob_ids(conv_data: dict) -> set[str]:
     return blob_ids
 
 
+def _extract_agent_blob_ids(conv_data: dict) -> set[str]:
+    """Blob IDs referenced by the composer-level conversationState.
+
+    Retained for backwards compatibility (used by repair). For the
+    complete set needed to continue a chat -- including nested references
+    -- use :func:`_extract_agent_blobs`, which walks the transitive
+    closure.
+    """
+    return _parse_cs_blob_ids((conv_data or {}).get("conversationState", ""))
+
+
+def _scan_blob_refs(data, known_raw: set) -> set[str]:
+    """Find references to known agentKv blobs embedded in a blob's bytes.
+
+    Cursor's agent blobs reference one another by raw 32-byte hash. We
+    slide a 32-byte window over the blob and keep only windows that match
+    a real, known blob hash (exact set membership -- no false positives).
+    """
+    if not data:
+        return set()
+    if isinstance(data, str):
+        data = data.encode("utf-8", "ignore")
+    found: set[str] = set()
+    mv = memoryview(data)
+    for i in range(len(data) - 31):
+        chunk = bytes(mv[i : i + 32])
+        if chunk in known_raw:
+            found.add(chunk.hex())
+    return found
+
+
 def _extract_agent_blobs(
     conv_data: dict,
     cdb: "db.CursorDB",
+    bubbles: Optional[dict] = None,
 ) -> dict[str, str]:
-    """Fetch agentKv blob entries referenced by a conversation.
+    """Fetch the agentKv blobs needed to continue a conversation.
+
+    Cursor's agent state is a content-addressed blob store. The
+    conversationState protobufs reference *top-level* blobs, but those
+    blobs reference further blobs in turn. If any blob in the closure is
+    missing, Cursor's agent loop fails with "Blob not found" when the chat
+    is continued (the failure mode that made cross-machine copies
+    unresumable).
+
+    We therefore walk the full transitive closure: seed from the composer
+    and every bubble's conversationState, then BFS by scanning each
+    reachable blob's bytes for embedded references to other known blobs.
 
     Returns a dict mapping hex blob IDs to their base64-encoded values.
     Values are stored as binary in the DB; we base64-encode them for JSON
@@ -392,17 +448,41 @@ def _extract_agent_blobs(
     """
     import base64
 
-    blob_ids = _extract_agent_blob_ids(conv_data)
-    if not blob_ids:
+    # Universe of real blob hashes -- enables exact membership tests when
+    # scanning blob bodies (so embedded text can never be a false match).
+    known: set[str] = set()
+    prefix = "agentKv:blob:"
+    for key in cdb.list_keys(prefix):
+        known.add(key[len(prefix):])
+    if not known:
         return {}
+    known_raw = {bytes.fromhex(h) for h in known}
 
-    blobs: dict[str, str] = {}
-    for bid in blob_ids:
-        key = f"agentKv:blob:{bid}"
-        val = cdb.get_item_binary(key, table="cursorDiskKV")
-        if val is not None:
-            blobs[bid] = base64.b64encode(val).decode("ascii")
-    return blobs
+    # Seed from composer + bubble conversationState references.
+    seeds = _parse_cs_blob_ids((conv_data or {}).get("conversationState", ""))
+    if bubbles:
+        for b in bubbles.values():
+            if isinstance(b, dict):
+                seeds |= _parse_cs_blob_ids(b.get("conversationState", ""))
+    seeds &= known  # drop anything not actually stored (defensive)
+
+    blobs: dict[str, bytes] = {}
+    frontier = set(seeds)
+    while frontier:
+        nxt: set[str] = set()
+        for h in frontier:
+            if h in blobs:
+                continue
+            val = cdb.get_item_binary(f"{prefix}{h}", table="cursorDiskKV")
+            if val is None:
+                continue
+            blobs[h] = val
+            for child in _scan_blob_refs(val, known_raw):
+                if child not in blobs:
+                    nxt.add(child)
+        frontier = nxt
+
+    return {h: base64.b64encode(v).decode("ascii") for h, v in blobs.items()}
 
 
 def export_conversation(
@@ -464,10 +544,11 @@ def export_conversation(
                 checkpoints[cp_id] = val
 
         # Agent state blobs (encrypted agent context needed for continuation).
-        # The conversationState field in composerData is a protobuf containing
-        # references to agentKv:blob:{hex} entries. Without these, Cursor's
+        # conversationState protobufs (composer + bubbles) reference top-level
+        # agentKv:blob:{hex} entries, which in turn reference further blobs.
+        # We walk the full transitive closure; without every blob, Cursor's
         # agent loop fails with "Blob not found" when continuing the chat.
-        agent_blobs = _extract_agent_blobs(conv_data, _cdb)
+        agent_blobs = _extract_agent_blobs(conv_data, _cdb, bubbles=bubbles)
 
         snapshot = {
             "version": 3,

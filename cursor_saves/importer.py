@@ -1072,10 +1072,19 @@ def copy_between_workspaces(
 def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     """Scan all conversations for missing agentKv blobs and backfill from snapshots.
 
+    Detection walks the full transitive closure of each conversation's
+    agent blobs (seeded from the composer + every bubble conversationState,
+    then following references embedded inside reachable blobs), so it finds
+    not just top-level references but the *nested* blobs that actually cause
+    "Blob not found" on continuation. The membership universe is the union
+    of blobs present in the DB and blobs available in v>=3 snapshots, which
+    lets the walk follow references into a missing blob (via its snapshot
+    copy) to discover further missing blobs.
+
     Returns (conversations_repaired, blobs_restored).
     """
     import base64
-    from .export import _extract_agent_blob_ids
+    from .export import _parse_cs_blob_ids, _scan_blob_refs
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
@@ -1085,27 +1094,95 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     if not snapshots_dir.exists():
         return 0, 0
 
-    # Phase 1: Find conversations with missing blobs
-    missing_map: dict[str, set[str]] = {}  # composerId -> set of missing blob hex IDs
+    # Phase 0: Index every restorable blob from v>=3 snapshots. Blobs are
+    # content-addressed, so the hex ID dedupes identical content across
+    # snapshots.
+    snap_blobs: dict[str, bytes] = {}
+    for project_dir in snapshots_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for sf in list_snapshot_files(project_dir):
+            meta = read_snapshot_meta(sf)
+            if meta.get("version", 1) < 3:
+                continue
+            try:
+                snap = read_snapshot_file(sf)
+            except Exception:
+                continue
+            for bid, b64val in (snap.get("agentBlobs") or {}).items():
+                if bid not in snap_blobs:
+                    try:
+                        snap_blobs[bid] = base64.b64decode(b64val)
+                    except Exception:
+                        pass
+
+    if verbose:
+        print(f"  Indexed {len(snap_blobs)} blob(s) from snapshots")
+
+    # Phase 1: Find conversations with missing blobs via transitive closure.
+    # The membership "universe" is every blob we could possibly reference and
+    # restore: those present in the DB plus those available in snapshots.
+    # Constraining both seeds and discovered references to this universe keeps
+    # the walk to genuine, corroborated blob IDs (random 32-byte protobuf
+    # fields / parse artifacts are ignored) and guarantees every detected
+    # missing blob is restorable from a snapshot.
+    missing_map: dict[str, set[str]] = {}  # composerId -> missing (restorable) hex IDs
 
     with db.CursorDB(global_db_path) as cdb:
-        all_keys = cdb.list_keys("composerData:")
-        for key in all_keys:
+        prefix = "agentKv:blob:"
+        db_present = {k[len(prefix):] for k in cdb.list_keys(prefix)}
+        universe = db_present | set(snap_blobs.keys())
+        universe_raw = {bytes.fromhex(h) for h in universe}
+
+        # Resolve a blob's child references once (content-addressed -> cacheable).
+        child_cache: dict[str, set[str]] = {}
+
+        def children(h: str) -> set[str]:
+            cached = child_cache.get(h)
+            if cached is not None:
+                return cached
+            data: bytes | None = None
+            if h in db_present:
+                data = cdb.get_item_binary(f"{prefix}{h}", table="cursorDiskKV")
+            if data is None:
+                data = snap_blobs.get(h)
+            refs = _scan_blob_refs(data, universe_raw) if data is not None else set()
+            child_cache[h] = refs
+            return refs
+
+        for key in cdb.list_keys("composerData:"):
             cd = cdb.get_json(key)
             if not cd:
                 continue
-            refs = _extract_agent_blob_ids(cd)
-            if not refs:
+            cid = key.split(":", 1)[1]
+
+            seeds = _parse_cs_blob_ids(cd.get("conversationState", ""))
+            for bk in cdb.list_keys(f"bubbleId:{cid}:"):
+                bub = cdb.get_json(bk)
+                if isinstance(bub, dict):
+                    seeds |= _parse_cs_blob_ids(bub.get("conversationState", ""))
+            seeds &= universe  # only walk corroborated blob IDs
+            if not seeds:
                 continue
 
-            missing = set()
-            for bid in refs:
-                val = cdb.get_item_binary(f"agentKv:blob:{bid}", table="cursorDiskKV")
-                if val is None:
-                    missing.add(bid)
+            # BFS the closure; following into snapshot copies of missing blobs.
+            closure: set[str] = set()
+            frontier = set(seeds)
+            while frontier:
+                nxt: set[str] = set()
+                for h in frontier:
+                    if h in closure:
+                        continue
+                    closure.add(h)
+                    for ch in children(h):
+                        if ch not in closure:
+                            nxt.add(ch)
+                frontier = nxt
 
+            # Every closure member is in the universe, so anything absent from
+            # the DB is necessarily available in a snapshot (restorable).
+            missing = {h for h in closure if h not in db_present}
             if missing:
-                cid = key.split(":", 1)[1]
                 missing_map[cid] = missing
 
     if not missing_map:
@@ -1113,63 +1190,17 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
             print("  No conversations with missing blobs.")
         return 0, 0
 
-    all_missing_ids = set()
-    for s in missing_map.values():
-        all_missing_ids |= s
+    restored_blobs: dict[str, bytes] = {}
+    for missing in missing_map.values():
+        for bid in missing:
+            if bid not in restored_blobs:
+                restored_blobs[bid] = snap_blobs[bid]
 
     if verbose:
-        print(f"  {len(missing_map)} conversation(s) with {len(all_missing_ids)} unique missing blob(s)")
+        print(f"  {len(missing_map)} conversation(s) with "
+              f"{len(restored_blobs)} unique restorable blob(s)")
 
-    # Phase 2: Scan snapshots that contain agentBlobs (version >= 3).
-    # Only decompress snapshots that might contain the missing blobs.
-    restored_blobs: dict[str, bytes] = {}
-
-    for project_dir in snapshots_dir.iterdir():
-        if not project_dir.is_dir():
-            continue
-        for sf in list_snapshot_files(project_dir):
-            if not all_missing_ids - set(restored_blobs.keys()):
-                break
-
-            meta = read_snapshot_meta(sf)
-            if meta.get("version", 1) < 3:
-                continue
-
-            if verbose:
-                print(f"  Scanning: {sf.name}")
-
-            try:
-                snap = read_snapshot_file(sf)
-            except Exception:
-                continue
-
-            snap_blobs = snap.get("agentBlobs", {})
-            if not snap_blobs:
-                continue
-
-            found_any = False
-            for bid, b64val in snap_blobs.items():
-                if bid in all_missing_ids and bid not in restored_blobs:
-                    try:
-                        restored_blobs[bid] = base64.b64decode(b64val)
-                        found_any = True
-                    except Exception:
-                        pass
-
-            if found_any and verbose:
-                count = sum(1 for b in snap_blobs if b in all_missing_ids)
-                print(f"    Found {count} matching blob(s)")
-
-        if not all_missing_ids - set(restored_blobs.keys()):
-            break
-
-    if not restored_blobs:
-        if verbose:
-            still_missing = len(all_missing_ids)
-            print(f"  No matching blobs found in snapshots ({still_missing} still missing)")
-        return 0, 0
-
-    # Phase 3: Write restored blobs to the global DB
+    # Phase 2: Write restored blobs to the global DB.
     backup_path = db.backup_db(global_db_path)
     if verbose:
         print(f"  Backed up global DB to {backup_path.name}")
@@ -1180,16 +1211,7 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
             for bid, val in restored_blobs.items()
         ])
 
-    conversations_fixed = 0
-    for cid, missing in missing_map.items():
-        if missing & set(restored_blobs.keys()):
-            conversations_fixed += 1
-
-    remaining = len(all_missing_ids) - len(restored_blobs)
-    if verbose and remaining > 0:
-        print(f"  {remaining} blob(s) not found in any snapshot (from conversations not yet pushed)")
-
-    return conversations_fixed, len(restored_blobs)
+    return len(missing_map), len(restored_blobs)
 
 
 # ── Doctor: audit and recover orphaned chats ─────────────────────────
