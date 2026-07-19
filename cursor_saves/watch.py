@@ -46,21 +46,37 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
-def is_watch_running() -> bool:
-    """Return True if another watch --all daemon is already running."""
-    pid_path = get_watch_pid_path()
+def _read_pid_file(pid_path: Path) -> int | None:
+    """Return the PID stored in *pid_path*, or None if missing/invalid."""
     if not pid_path.exists():
-        return False
+        return None
     try:
-        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        return int(pid_path.read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
+        return None
+
+
+def _remove_stale_pid_file(pid_path: Path) -> bool:
+    """Remove a stale PID file. Returns True if removed or absent."""
+    pid = _read_pid_file(pid_path)
+    if pid is not None and is_pid_alive(pid):
         return False
-    if is_pid_alive(pid):
-        return True
     try:
         pid_path.unlink(missing_ok=True)
     except OSError:
-        pass
+        return False
+    return True
+
+
+def is_watch_running() -> bool:
+    """Return True if another watch --all daemon is already running."""
+    pid_path = get_watch_pid_path()
+    pid = _read_pid_file(pid_path)
+    if pid is None:
+        return False
+    if is_pid_alive(pid):
+        return True
+    _remove_stale_pid_file(pid_path)
     return False
 
 
@@ -70,19 +86,43 @@ def write_watch_pid() -> None:
 
 
 def remove_watch_pid() -> None:
-    """Remove the watch PID file on shutdown."""
+    """Remove the watch PID file on shutdown if this process owns it."""
+    pid_path = get_watch_pid_path()
+    pid = _read_pid_file(pid_path)
+    if pid is None:
+        return
+    if pid != os.getpid():
+        return
     try:
-        get_watch_pid_path().unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
     except OSError:
         pass
 
 
 def acquire_watch_pid() -> bool:
     """Claim the watch singleton. Returns False if another instance is running."""
-    if is_watch_running():
-        return False
-    write_watch_pid()
-    return True
+    pid_path = get_watch_pid_path()
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(5):
+        pid = _read_pid_file(pid_path)
+        if pid is not None and is_pid_alive(pid):
+            return False
+        if pid is not None and not _remove_stale_pid_file(pid_path):
+            return False
+
+        try:
+            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        return True
+
+    return False
 
 
 def _sleep_interruptible(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -59,6 +60,29 @@ class TestWatchPid(TempWatchEnvMixin, unittest.TestCase):
         pid_path.write_text("999999999", encoding="utf-8")
         self.assertFalse(is_watch_running())
         self.assertFalse(pid_path.exists())
+
+    def test_remove_watch_pid_only_own(self):
+        pid_path = get_watch_pid_path()
+        pid_path.write_text("999999999", encoding="utf-8")
+        remove_watch_pid()
+        self.assertTrue(pid_path.exists())
+
+    def test_concurrent_acquire_only_one_wins(self):
+        results: list[bool] = []
+        barrier = threading.Barrier(8)
+
+        def try_acquire():
+            barrier.wait()
+            results.append(acquire_watch_pid())
+
+        threads = [threading.Thread(target=try_acquire) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sum(results), 1)
+        remove_watch_pid()
 
 
 class TestWatchCursorGate(TempWatchEnvMixin, unittest.TestCase):

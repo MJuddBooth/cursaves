@@ -41,14 +41,21 @@ def _hook_command() -> str:
 def _windows_hook_script() -> str:
     return """# cursaves auto-sync hook — starts background watch when Cursor opens a session
 $ErrorActionPreference = 'SilentlyContinue'
-$pidFile = Join-Path $env:USERPROFILE '.cursaves\\watch.pid'
-if (Test-Path $pidFile) {
-    $pid = Get-Content $pidFile -ErrorAction SilentlyContinue
-    if ($pid -and (Get-Process -Id $pid -ErrorAction SilentlyContinue)) { exit 0 }
+$mutex = New-Object System.Threading.Mutex($false, 'Global\\CursavesWatchDetach')
+if (-not $mutex.WaitOne(0)) { exit 0 }
+try {
+    $pidFile = Join-Path $env:USERPROFILE '.cursaves\\watch.pid'
+    if (Test-Path $pidFile) {
+        $pid = Get-Content $pidFile -ErrorAction SilentlyContinue
+        if ($pid -and (Get-Process -Id $pid -ErrorAction SilentlyContinue)) { exit 0 }
+    }
+    $cursaves = (Get-Command cursaves -ErrorAction SilentlyContinue).Source
+    if (-not $cursaves) { exit 0 }
+    Start-Process -FilePath $cursaves -ArgumentList 'watch','--all','--detach' -WindowStyle Hidden
+} finally {
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
 }
-$cursaves = (Get-Command cursaves -ErrorAction SilentlyContinue).Source
-if (-not $cursaves) { exit 0 }
-Start-Process -FilePath $cursaves -ArgumentList 'watch','--all','--detach' -WindowStyle Hidden
 exit 0
 """
 
