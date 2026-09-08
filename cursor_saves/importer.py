@@ -1834,3 +1834,127 @@ def purge_chats(
             continue
 
     return len(composer_ids), total_keys
+
+
+# ── Move / re-tag ─────────────────────────────────────────────────────
+
+
+def _workspace_identifier_for_hash(ws_id: str) -> Optional[dict]:
+    """Build the workspaceIdentifier object to stamp onto a moved chat.
+
+    Prefers an exact copy of an identifier already used by a chat in the
+    target workspace (guarantees the moved chat matches native chats there).
+    Falls back to constructing one from the target's workspace.json, and
+    finally to a minimal ``{"id": ws_id}``.
+    """
+    # 1) Reuse an existing chat's identifier for this workspace (most accurate).
+    headers_map = paths._build_global_headers_map()
+    for e in headers_map.get(ws_id, []):
+        wi = e.get("workspaceIdentifier")
+        if isinstance(wi, dict) and wi.get("id") == ws_id:
+            return json.loads(json.dumps(wi))
+
+    # 2) Construct from the target workspace.json.
+    ws_json = paths.get_workspace_storage_dir() / ws_id / "workspace.json"
+    if ws_json.exists():
+        try:
+            data = json.loads(ws_json.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        uri = data.get("workspace")
+        if isinstance(uri, str) and uri.startswith("file://"):
+            p = uri[len("file://"):].replace("%20", " ")
+            return {
+                "id": ws_id,
+                "configPath": {
+                    "$mid": 1, "fsPath": p, "external": uri,
+                    "path": p, "scheme": "file",
+                },
+            }
+
+    # 3) Minimal identifier (Cursor groups by id).
+    return {"id": ws_id}
+
+
+def move_chat(
+    composer_ids: list[str],
+    to_ws_id: str,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Re-tag chats to a different workspace.
+
+    Rewrites ``workspaceIdentifier.id`` in each chat's global
+    ``composerData:<id>`` row (and the legacy ``composer.composerHeaders``
+    ItemTable blob when present). Message data (bubbles, agentKv blobs,
+    checkpoints, contexts) is keyed by composerId, so it travels
+    automatically -- only the workspace tag changes.
+
+    If ``to_ws_id`` is ``paths.UNASSIGNED_WS_ID`` the workspace tag is
+    stripped instead (chat becomes global/unassigned).
+
+    Returns (moved_count, skipped_count).
+    """
+    if not composer_ids:
+        return 0, 0
+
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0, 0
+
+    untag = to_ws_id == paths.UNASSIGNED_WS_ID
+    target_wi = None if untag else _workspace_identifier_for_hash(to_ws_id)
+
+    def _retag(obj: dict) -> None:
+        if untag:
+            obj.pop("workspaceIdentifier", None)
+        elif isinstance(target_wi, dict):
+            obj["workspaceIdentifier"] = json.loads(json.dumps(target_wi))
+        else:
+            wi = obj.get("workspaceIdentifier")
+            wi = dict(wi) if isinstance(wi, dict) else {}
+            wi["id"] = to_ws_id
+            obj["workspaceIdentifier"] = wi
+
+    backup_path = db.backup_db(global_db_path)
+    print(f"  Backed up global DB to {backup_path.name}")
+
+    cid_set = set(composer_ids)
+    moved = skipped = 0
+
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        for cid in composer_ids:
+            cd = write_cdb.get_json(f"composerData:{cid}")
+            if not isinstance(cd, dict):
+                skipped += 1
+                continue
+            _retag(cd)
+            write_cdb.write_json(f"composerData:{cid}", cd)
+            moved += 1
+
+        # Legacy ItemTable headers blob (pre-migration Cursor keeps it here).
+        headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        if isinstance(headers, dict) and headers.get("allComposers"):
+            changed = False
+            for e in headers["allComposers"]:
+                if e.get("composerId") in cid_set:
+                    _retag(e)
+                    changed = True
+            if changed:
+                write_cdb.write_json(
+                    "composer.composerHeaders", headers, table="ItemTable"
+                )
+    finally:
+        write_cdb.close()
+
+    paths.invalidate_headers_cache()
+    return moved, skipped

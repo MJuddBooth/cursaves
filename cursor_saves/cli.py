@@ -1661,6 +1661,110 @@ def cmd_purge(args):
     print()
 
 
+def _resolve_move_targets(id_query: Optional[str], from_ws: Optional[str]) -> tuple[list[dict], "Optional[str]"]:
+    """Resolve the set of chats to move from --id / --from selectors.
+
+    Returns (chats, error) where chats is a list of {id, name, ws} dicts.
+    On error, chats is [] and error is a message string.
+    """
+    headers_map = paths._build_global_headers_map()
+    # Flat index: composerId -> (name, current_ws_id)
+    index: dict[str, tuple[str, str]] = {}
+    for ws_id, entries in headers_map.items():
+        for e in entries:
+            cid = e.get("composerId")
+            if cid:
+                index[cid] = (e.get("name", ""), ws_id)
+
+    chosen: dict[str, dict] = {}
+
+    if from_ws:
+        src = paths.resolve_workspace(from_ws)
+        if src is None:
+            return [], f"No workspace matching '{from_ws}'."
+        src_hash = src["workspace_dir"].name
+        for cid, (name, ws_id) in index.items():
+            if ws_id == src_hash:
+                chosen[cid] = {"id": cid, "name": name, "ws": ws_id}
+        if not chosen:
+            return [], f"No chats tagged to workspace '{from_ws}' ({src_hash[:12]})."
+
+    if id_query:
+        matches = {
+            cid: (name, ws_id)
+            for cid, (name, ws_id) in index.items()
+            if cid == id_query or cid.startswith(id_query) or id_query in cid
+        }
+        if not matches:
+            return [], f"No chat matching id '{id_query}'."
+        for cid, (name, ws_id) in matches.items():
+            chosen[cid] = {"id": cid, "name": name, "ws": ws_id}
+
+    return list(chosen.values()), None
+
+
+def cmd_move_chat(args):
+    """Re-tag chats to a different workspace (change their workspaceIdentifier)."""
+    from .importer import move_chat
+
+    if not args.id and not args.from_ws:
+        print("Error: specify --id <composer-id> and/or --from <workspace>.", file=sys.stderr)
+        sys.exit(1)
+
+    to_ws = paths.resolve_workspace(args.to)
+    if to_ws is None:
+        print(
+            f"Error: No workspace matching '{args.to}'.\n"
+            f"Run 'cursaves workspaces' to see available workspaces "
+            f"(or use 'unassigned' to strip the workspace tag).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    to_hash = to_ws["workspace_dir"].name
+
+    chats, err = _resolve_move_targets(args.id, args.from_ws)
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    # Drop chats already tagged to the destination.
+    chats = [c for c in chats if c["ws"] != to_hash]
+    if not chats:
+        print("Nothing to move (chats already in the destination workspace).")
+        return
+
+    dest_label = to_hash[:12] if to_hash == paths.UNASSIGNED_WS_ID else f"{to_ws['path']} ({to_hash[:12]})"
+    print(f"\nMove {len(chats)} chat(s) -> {dest_label}\n")
+    for c in chats:
+        name = c["name"] or "(untitled)"
+        if len(name) > 44:
+            name = name[:41] + "..."
+        print(f"  {c['id'][:8]}  from {c['ws'][:12]:<13} {name}")
+
+    if args.dry_run:
+        print("\nDry run: no changes written.")
+        return
+
+    if not args.yes:
+        try:
+            resp = input(f"\nProceed? [y/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    moved, skipped = move_chat([c["id"] for c in chats], to_hash, force=args.force)
+    if moved == 0 and skipped == 0:
+        return  # move_chat already printed the reason (e.g. Cursor running)
+
+    print(f"\nMoved {moved} chat(s)" + (f", skipped {skipped}" if skipped else "") + ".")
+    if moved:
+        paths.invalidate_headers_cache()
+        from .reload import print_reload_hint
+        print_reload_hint()
+
+
 def cmd_migrate(args):
     """Migrate old chats to the Cursor 3.0 global index."""
     from .importer import migrate_to_global_headers
@@ -1904,6 +2008,37 @@ def main():
         help="Skip the Cursor-running check (use if you can't fully quit Cursor)",
     )
     p_doctor.set_defaults(func=cmd_doctor)
+
+    # ── move-chat ──────────────────────────────────────────────────
+    p_move = subparsers.add_parser(
+        "move-chat",
+        help="Re-tag chats to a different workspace (change workspaceIdentifier)",
+    )
+    p_move.add_argument(
+        "--to", required=True,
+        help="Destination workspace: hash, index, path substring, or 'unassigned'",
+    )
+    p_move.add_argument(
+        "--from", dest="from_ws",
+        help="Move ALL chats currently tagged to this source workspace",
+    )
+    p_move.add_argument(
+        "--id",
+        help="Move a specific chat by (partial) composer id",
+    )
+    p_move.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would move without writing",
+    )
+    p_move.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt",
+    )
+    p_move.add_argument(
+        "--force", action="store_true",
+        help="Skip the Cursor-running check",
+    )
+    p_move.set_defaults(func=cmd_move_chat)
 
     p_migrate = subparsers.add_parser(
         "migrate", help="Migrate old chats to Cursor 3.0 global index"
