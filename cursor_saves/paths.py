@@ -331,6 +331,11 @@ def get_global_composer_headers() -> list[dict]:
     return []
 
 
+# Sentinel workspace id for chats that carry no workspaceIdentifier in the
+# global index. Newer Cursor builds leave many chats untagged; they still
+# appear in the (global) agents window, so we surface them under this bucket.
+UNASSIGNED_WS_ID = "unassigned"
+
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
 
 
@@ -339,18 +344,72 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
 
     Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
     Each value is a list of composer header dicts for that workspace.
-    Cached for the lifetime of the process.
+
+    Two sources are merged (deduplicated by composerId within each workspace):
+
+      1. The legacy ``composer.composerHeaders`` ItemTable blob (pre-migration
+         Cursor 3.0 builds keep the whole index here).
+      2. The per-row ``composerData:*`` entries in the global DB's
+         ``cursorDiskKV`` table. Newer Cursor builds migrate the header index
+         out of the ItemTable blob into these rows (flagged by
+         ``composer.composerHeaders.migratedToTable``), leaving the blob empty.
+         Without this source cursaves is blind to every chat that only lives
+         in the migrated table.
+
+    Chats whose ``workspaceIdentifier`` is missing are grouped under the
+    ``UNASSIGNED_WS_ID`` sentinel so they stay discoverable. Cached for the
+    lifetime of the process.
     """
     global _global_headers_cache
     if _global_headers_cache is not None:
         return _global_headers_cache
 
+    from . import db
+
     result: dict[str, list[dict]] = {}
-    for entry in get_global_composer_headers():
-        wi = entry.get("workspaceIdentifier", {})
-        ws_id = wi.get("id", "")
-        if ws_id:
-            result.setdefault(ws_id, []).append(entry)
+    seen_by_ws: dict[str, set[str]] = {}
+
+    def _add(entry: dict) -> None:
+        cid = entry.get("composerId")
+        if not cid:
+            return
+        wi = entry.get("workspaceIdentifier")
+        ws_id = wi.get("id") if isinstance(wi, dict) else None
+        ws_id = ws_id or UNASSIGNED_WS_ID
+        seen = seen_by_ws.setdefault(ws_id, set())
+        if cid in seen:
+            return
+        seen.add(cid)
+        result.setdefault(ws_id, []).append(entry)
+
+    global_db = get_global_db_path()
+    if global_db.exists():
+        try:
+            with db.CursorDB(global_db) as cdb:
+                # Source 1: legacy ItemTable headers blob
+                blob = cdb.get_json("composer.composerHeaders", table="ItemTable")
+                if isinstance(blob, dict):
+                    for entry in blob.get("allComposers", []):
+                        if isinstance(entry, dict):
+                            _add(entry)
+
+                # Source 2: migrated per-row composerData entries
+                for key in cdb.list_keys("composerData:", table="cursorDiskKV"):
+                    cd = cdb.get_json(key, table="cursorDiskKV")
+                    if not isinstance(cd, dict):
+                        continue
+                    _add({
+                        "composerId": key[len("composerData:"):],
+                        "name": cd.get("name", ""),
+                        "createdAt": cd.get("createdAt", 0),
+                        "lastUpdatedAt": cd.get("lastUpdatedAt", 0),
+                        "unifiedMode": cd.get("unifiedMode", "agent"),
+                        "forceMode": cd.get("forceMode", ""),
+                        "workspaceIdentifier": cd.get("workspaceIdentifier"),
+                    })
+        except Exception:
+            pass
+
     _global_headers_cache = result
     return result
 
@@ -429,15 +488,59 @@ def list_workspaces_with_conversations() -> list[dict]:
     Returns the same dicts as list_all_workspaces(), plus a
     'conversations' key with the count.
     """
+    headers_map = _build_global_headers_map()
     result = []
+    covered_ws_ids: set[str] = set()
+
     for ws in list_all_workspaces():
+        ws_hash = ws["workspace_dir"].name
         db_path = ws["workspace_dir"] / "state.vscdb"
-        if not db_path.exists():
-            continue
-        composer_ids = get_workspace_composer_ids(db_path)
+        if db_path.exists():
+            composer_ids = get_workspace_composer_ids(db_path)
+        else:
+            # No local DB, but the global index may still tag chats to this hash.
+            composer_ids = [
+                e.get("composerId")
+                for e in headers_map.get(ws_hash, [])
+                if e.get("composerId")
+            ]
         if composer_ids:
+            covered_ws_ids.add(ws_hash)
             ws["conversations"] = len(composer_ids)
             result.append(ws)
+
+    # Global-index workspace hashes that have no workspaceStorage dir (e.g. the
+    # dir was removed, or Cursor changed its hashing across versions). Surface
+    # them so their chats remain listable/targetable by hash.
+    for ws_id, entries in headers_map.items():
+        if ws_id == UNASSIGNED_WS_ID or ws_id in covered_ws_ids:
+            continue
+        count = len([e for e in entries if e.get("composerId")])
+        if not count:
+            continue
+        result.append({
+            "folder_uri": "",
+            "path": f"(no workspace dir: {ws_id[:12]})",
+            "type": "global",
+            "host": None,
+            "workspace_dir": get_workspace_storage_dir() / ws_id,
+            "mtime": 0,
+            "conversations": count,
+        })
+
+    # Synthetic bucket for chats that carry no workspaceIdentifier at all.
+    unassigned = [e for e in headers_map.get(UNASSIGNED_WS_ID, []) if e.get("composerId")]
+    if unassigned:
+        result.append({
+            "folder_uri": "",
+            "path": "(global / unassigned)",
+            "type": "global",
+            "host": None,
+            "workspace_dir": get_workspace_storage_dir() / UNASSIGNED_WS_ID,
+            "mtime": 0,
+            "conversations": len(unassigned),
+        })
+
     return result
 
 
@@ -460,19 +563,22 @@ def resolve_workspace(selector: str) -> Optional[dict]:
     except ValueError:
         pass
 
-    # Try as workspace hash (exact match, or prefix match when selector is 8 chars (short hash))
-    # Allow the short hash because that's what's displayed in the workspaces list,
-    # so user can just copy-paste the short hash, e.g. `cursaves push -w 497e8ab0`
+    # Try as workspace hash. Exact match wins; otherwise allow a prefix match
+    # for hash-length selectors (>= 8 chars) so users can paste either the
+    # short 8-char hash shown in `cursaves workspaces` or any longer prefix,
+    # e.g. `cursaves push -w 497e8ab0` or `-w f62e124ab`.
     for ws in workspaces:
-        name = ws["workspace_dir"].name
-        if len(selector) == 8:
-            # Short hash match (8 chars) - allow prefix match
-            if name.startswith(selector):
-                return ws
-        else:
-            # Exact match
-            if name == selector:
-                return ws
+        if ws["workspace_dir"].name == selector:
+            return ws
+    if len(selector) >= 8:
+        prefix_matches = [
+            ws for ws in workspaces
+            if ws["workspace_dir"].name.startswith(selector)
+        ]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+        if len(prefix_matches) > 1:
+            return None  # ambiguous - refuse rather than guess
 
     # Try as path substring
     for ws in workspaces:
