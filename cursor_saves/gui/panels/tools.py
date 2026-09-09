@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-from ...importer import copy_between_workspaces
+from ...importer import copy_between_workspaces, move_chat
 from ..runner import CommandRunner
 from ..widgets import ChatCheckList, WorkspaceSelector, confirm_action, warn_cursor_running
 
@@ -152,6 +152,69 @@ def build_tools(parent, runner: CommandRunner, log_append, require_sync_ready) -
     ctk.CTkButton(copy_frame, text="Copy selected chats", command=do_copy, width=180).pack(
         anchor="w", padx=4, pady=8,
     )
+
+    ctk.CTkLabel(
+        frame, text="Move chats to another workspace", font=ctk.CTkFont(weight="bold"),
+    ).pack(anchor="w", padx=4, pady=(12, 4))
+    ctk.CTkLabel(
+        frame,
+        text="Re-tags chats to the target workspace (rewrites workspaceIdentifier). "
+        "The chat and its history move; nothing is duplicated.",
+        text_color="gray",
+        wraplength=500,
+        justify="left",
+    ).pack(anchor="w", padx=4, pady=(0, 4))
+    move_frame = ctk.CTkFrame(frame, fg_color="transparent")
+    move_frame.pack(fill="x", pady=4)
+
+    mv_src_ws = WorkspaceSelector(move_frame, label="Source workspace (to load chats)")
+    mv_tgt_ws = WorkspaceSelector(move_frame, label="Target workspace")
+    mv_chat_list = ChatCheckList(move_frame)
+    mv_force_var = ctk.BooleanVar(value=False)
+    ctk.CTkCheckBox(move_frame, text="Force", variable=mv_force_var).pack(
+        anchor="w", padx=4, pady=4,
+    )
+
+    def load_move_chats():
+        ws = mv_src_ws.get_workspace()
+        if ws:
+            mv_chat_list.load(ws["path"], ws["workspace_dir"])
+
+    ctk.CTkButton(
+        move_frame, text="Load chats from source", command=load_move_chats, width=180,
+    ).pack(anchor="w", padx=4, pady=4)
+
+    def do_move():
+        target = mv_tgt_ws.get_workspace()
+        if not target:
+            log_append("Select a target workspace.\n")
+            return
+        ids = mv_chat_list.selected_ids()
+        if not ids:
+            log_append("No chats selected.\n")
+            return
+        source = mv_src_ws.get_workspace()
+        if source and str(source["workspace_dir"]) == str(target["workspace_dir"]):
+            log_append("Source and target must be different.\n")
+            return
+        if warn_cursor_running("move-chat", allow_force=True) is False:
+            return
+        if not confirm_action(
+            "Move chats", f"Re-tag {len(ids)} chat(s) to {target['path']}?",
+        ):
+            return
+
+        to_ws_id = target["workspace_dir"].name
+
+        def _move():
+            moved, skipped = move_chat(ids, to_ws_id, force=mv_force_var.get())
+            print(f"Move done: {moved} moved, {skipped} skipped.")
+
+        runner.run_callable(_move)
+
+    ctk.CTkButton(
+        move_frame, text="Move selected chats", command=do_move, width=180,
+    ).pack(anchor="w", padx=4, pady=8)
 
     ctk.CTkLabel(frame, text="Manage synced chats", font=ctk.CTkFont(weight="bold")).pack(
         anchor="w", padx=4, pady=(12, 4),

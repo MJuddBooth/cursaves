@@ -2988,6 +2988,7 @@ def main():
             "─── Copy between workspaces (same machine) ─────────────────────\n"
             "\n"
             "  copy                  Copy chats between workspaces\n"
+            "  move-chat --to <ws>   Re-tag chats to another workspace\n"
             "\n"
             "─── Info & management ──────────────────────────────────────────\n"
             "\n"
