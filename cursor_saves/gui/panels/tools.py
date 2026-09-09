@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-from ...importer import copy_between_workspaces, move_chat
+from ...importer import (
+    copy_between_workspaces,
+    list_all_chats_with_sizes,
+    move_chat,
+    purge_chats,
+)
 from ..runner import CommandRunner
 from ..widgets import ChatCheckList, WorkspaceSelector, confirm_action, warn_cursor_running
 
@@ -41,6 +46,26 @@ def build_tools(parent, runner: CommandRunner, log_append, require_sync_ready) -
         if confirm_action("Purge", "Delete chats from Cursor DB to free space?"):
             run(["purge"])
 
+    def delete_empty_chats():
+        if warn_cursor_running("purge") is False:
+            return
+        all_chats = list_all_chats_with_sizes()
+        empty_ids = [c["composerId"] for c in all_chats if c["messageCount"] == 0]
+        if not empty_ids:
+            log_append("No empty (0-message) chats found.\n")
+            return
+        if not confirm_action(
+            "Delete empty chats",
+            f"Delete {len(empty_ids)} empty (0-message) chat(s) across all workspaces?",
+        ):
+            return
+
+        def _purge():
+            deleted, keys_removed = purge_chats(empty_ids, force=True)
+            print(f"Deleted {deleted} empty chat(s), removed {keys_removed:,} DB keys.")
+
+        runner.run_callable(_purge)
+
     maint_buttons = [
         ("Doctor", lambda: run(["doctor"])),
         ("Doctor recover", doctor_recover),
@@ -48,6 +73,7 @@ def build_tools(parent, runner: CommandRunner, log_append, require_sync_ready) -
         ("Migrate", migrate),
         ("Migrate dry-run", lambda: run(["migrate", "--dry-run"])),
         ("Purge", purge),
+        ("Delete empty chats", delete_empty_chats),
     ]
     row = ctk.CTkFrame(maint_frame, fg_color="transparent")
     row.pack(fill="x")

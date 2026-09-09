@@ -2171,8 +2171,19 @@ def cmd_purge(args):
         f"  {len(with_content)} with content, {len(stubs)} empty stubs\n"
     )
 
-    # Use interactive TUI for selection
-    selected_ids = select_purge_chats(with_content + stubs)
+    empty_only = getattr(args, "empty", False)
+    skip_confirm = getattr(args, "yes", False)
+
+    if empty_only:
+        # Auto-select every chat with no messages; skip the interactive picker.
+        selected_ids = [c["composerId"] for c in all_chats if c["messageCount"] == 0]
+        if not selected_ids:
+            print("  No empty (0-message) chats to delete.")
+            return
+        print(f"  Selecting {len(selected_ids)} empty (0-message) chat(s).")
+    else:
+        # Use interactive TUI for selection
+        selected_ids = select_purge_chats(with_content + stubs)
 
     if not selected_ids:
         print("  Nothing selected.")
@@ -2186,7 +2197,7 @@ def cmd_purge(args):
         f"({selected_keys:,} DB keys)."
     )
 
-    if not tui_confirm("Continue with deletion?"):
+    if not skip_confirm and not tui_confirm("Continue with deletion?"):
         print("  Cancelled.")
         return
 
@@ -2951,6 +2962,14 @@ def main():
     p_purge.add_argument(
         "--force", action="store_true",
         help="Skip the Cursor-running check",
+    )
+    p_purge.add_argument(
+        "--empty", action="store_true",
+        help="Auto-select all empty (0-message) chats and skip the picker",
+    )
+    p_purge.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (use with --empty for non-interactive purge)",
     )
     p_purge.set_defaults(func=cmd_purge)
 
