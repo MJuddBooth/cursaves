@@ -488,25 +488,25 @@ def list_workspaces_with_conversations() -> list[dict]:
     Returns the same dicts as list_all_workspaces(), plus a
     'conversations' key with the count.
     """
+    # Local import avoids a paths<->export circular import at module load.
+    from . import export
+
     headers_map = _build_global_headers_map()
     result = []
     covered_ws_ids: set[str] = set()
 
     for ws in list_all_workspaces():
         ws_hash = ws["workspace_dir"].name
-        db_path = ws["workspace_dir"] / "state.vscdb"
-        if db_path.exists():
-            composer_ids = get_workspace_composer_ids(db_path)
-        else:
-            # No local DB, but the global index may still tag chats to this hash.
-            composer_ids = [
-                e.get("composerId")
-                for e in headers_map.get(ws_hash, [])
-                if e.get("composerId")
-            ]
-        if composer_ids:
+        # Count only conversations that resolve to real data (same source as
+        # `list`), so dangling selectedComposerIds / chat-view-pane references
+        # -- chats with no composerData row in the global DB -- are not counted
+        # as phantom chats. This keeps `workspaces` and `list` in agreement.
+        convos = export.get_workspace_conversations(
+            ws["path"], workspace_dir=ws["workspace_dir"]
+        )
+        if convos:
             covered_ws_ids.add(ws_hash)
-            ws["conversations"] = len(composer_ids)
+            ws["conversations"] = len(convos)
             result.append(ws)
 
     # Global-index workspace hashes that have no workspaceStorage dir (e.g. the
