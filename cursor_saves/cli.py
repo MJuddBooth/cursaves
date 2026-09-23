@@ -2153,14 +2153,23 @@ def cmd_purge(args):
         return
 
     if ws_filter:
-        ws_filter_lower = ws_filter.lower()
-        all_chats = [
-            c for c in all_chats
-            if ws_filter_lower in c["workspace_label"].lower()
-        ]
-        if not all_chats:
+        # Resolve like `list`/`push` do: accept a workspace number, hash, or
+        # path. Fall back to a case-insensitive label substring match so the
+        # older behaviour (e.g. `purge -w mddb`) keeps working.
+        resolved = paths.resolve_workspace(ws_filter)
+        if resolved is not None:
+            target_dir = str(resolved["workspace_dir"])
+            filtered = [c for c in all_chats if c["workspace_dir"] == target_dir]
+        else:
+            ws_filter_lower = ws_filter.lower()
+            filtered = [
+                c for c in all_chats
+                if ws_filter_lower in c["workspace_label"].lower()
+            ]
+        if not filtered:
             print(f"  No chats matching workspace '{ws_filter}'.")
             return
+        all_chats = filtered
 
     with_content = [c for c in all_chats if c["messageCount"] > 0 or c["name"]]
     stubs = [c for c in all_chats if c["messageCount"] == 0 and not c["name"]]
@@ -2957,7 +2966,7 @@ def main():
     )
     p_purge.add_argument(
         "--workspace", "-w",
-        help="Filter to chats from a specific workspace (name substring)",
+        help="Filter to a workspace by number, hash, or path from 'cursaves workspaces' (also matches a name substring)",
     )
     p_purge.add_argument(
         "--force", action="store_true",
