@@ -633,6 +633,22 @@ def format_workspace_display(ws: dict, include_path: bool = True) -> str:
 # ── Project identification ────────────────────────────────────────────
 
 
+def safe_project_dirname(name: str) -> str:
+    """Reduce an arbitrary project label to a safe single-component dir name.
+
+    Guards against synthetic/display labels (e.g. "(global / unassigned)")
+    leaking path separators or stray punctuation into snapshot directory
+    names, which previously produced folders like " unassigned)".
+    """
+    if not name:
+        return "unknown"
+    # Collapse to a single path component and drop filesystem-illegal chars.
+    base = os.path.basename(os.path.normpath(name))
+    base = re.sub(r'[<>:"/\\|?*]+', "-", base)
+    base = base.strip(" .()-")
+    return base or "unknown"
+
+
 def get_project_identifier(project_path: str) -> str:
     """Get a stable identifier for a project, used as the snapshot subdirectory.
 
@@ -646,7 +662,7 @@ def get_project_identifier(project_path: str) -> str:
     remote_url = _get_git_remote_url(project_path)
     if remote_url:
         return _normalize_remote_url(remote_url)
-    return os.path.basename(os.path.normpath(project_path))
+    return safe_project_dirname(project_path)
 
 
 def _get_git_remote_url(project_path: str) -> Optional[str]:

@@ -879,6 +879,44 @@ def _register_in_global_headers(
         global_cdb.close()
 
 
+def _target_workspace_identifier(ws_dir: Path) -> dict:
+    """Build the workspaceIdentifier to stamp on a chat's global row.
+
+    Prefers the exact identifier native chats in this workspace already use
+    (so imported chats match them), then one constructed from workspace.json,
+    then a minimal ``{"id": <hash>}`` (Cursor groups by ``id``).
+    """
+    ws_hash = ws_dir.name
+    wi = _workspace_identifier_for_hash(ws_hash)
+    if isinstance(wi, dict) and len(wi) > 1:
+        return wi
+    built = _build_workspace_identifier(ws_dir)
+    return built if len(built) > 1 else {"id": ws_hash}
+
+
+def _stamp_global_workspace_identifier(composer_id: str, ws_dir: Path) -> None:
+    """Write workspaceIdentifier onto the global ``composerData:<id>`` row.
+
+    This is the authoritative workspace tag read by Cursor 3.x (and by
+    cursaves discovery). Without it, imported/copied chats land in the global
+    "unassigned" bucket even though the workspace window lists them via
+    ``selectedComposerIds``.
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return
+    gcdb = db.CursorDB(global_db_path)
+    try:
+        cd = gcdb.get_json(f"composerData:{composer_id}")
+        if not isinstance(cd, dict):
+            return
+        cd["workspaceIdentifier"] = _target_workspace_identifier(ws_dir)
+        gcdb.write_json(f"composerData:{composer_id}", cd)
+    finally:
+        gcdb.close()
+    paths.invalidate_headers_cache()
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
@@ -927,6 +965,12 @@ def _register_in_workspace(
         existing.setdefault("hasMigratedMultipleComposers", True)
 
         ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
+
+        # Stamp the authoritative per-row workspace tag in the global DB.
+        # Modern Cursor (3.x) groups chats by composerData:<id>.workspaceIdentifier,
+        # so without this an imported/copied chat would appear in the window
+        # (via selectedComposerIds) yet be "unassigned" in the global index.
+        _stamp_global_workspace_identifier(composer_id, ws_dir)
 
         # Cursor 3.0+: register in the global headers index
         if is_migrated:

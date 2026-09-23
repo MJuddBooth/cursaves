@@ -514,7 +514,10 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     project_id = snapshot.get("projectIdentifier")
     if not project_id:
         # Fallback for v1 snapshots without projectIdentifier
-        project_id = os.path.basename(snapshot.get("sourceProjectPath", "unknown"))
+        project_id = snapshot.get("sourceProjectPath", "unknown")
+    # Guard against synthetic/display labels producing malformed dir names
+    # (e.g. "(global / unassigned)" → " unassigned)").
+    project_id = paths.safe_project_dirname(project_id)
     project_dir = snapshots_dir / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
 
