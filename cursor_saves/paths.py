@@ -285,16 +285,21 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
     Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
     Each value is a list of composer header dicts for that workspace.
 
-    Two sources are merged (deduplicated by composerId within each workspace):
+    Two sources are merged (deduplicated by composerId, with the authoritative
+    per-row source winning):
 
-      1. The legacy ``composer.composerHeaders`` ItemTable blob (pre-migration
-         Cursor 3.0 builds keep the whole index here).
-      2. The per-row ``composerData:*`` entries in the global DB's
-         ``cursorDiskKV`` table. Newer Cursor builds migrate the header index
-         out of the ItemTable blob into these rows (flagged by
+      1. The per-row ``composerData:*`` entries in the global DB's
+         ``cursorDiskKV`` table. These are authoritative in Cursor 3.x and hold
+         the freshest ``name`` and ``workspaceIdentifier`` (e.g. after a chat is
+         moved or renamed), so they are processed FIRST and take precedence.
+         Newer Cursor builds migrate the header index out of the ItemTable blob
+         into these rows (flagged by
          ``composer.composerHeaders.migratedToTable``), leaving the blob empty.
          Without this source cursaves is blind to every chat that only lives
          in the migrated table.
+      2. The legacy ``composer.composerHeaders`` ItemTable blob (pre-migration
+         Cursor 3.0 builds keep the whole index here). Used only as a fallback
+         for chats that have no per-row entry; its names/workspace can be stale.
 
     Chats whose ``workspaceIdentifier`` is missing are grouped under the
     ``UNASSIGNED_WS_ID`` sentinel so they stay discoverable. Cached for the
@@ -307,33 +312,28 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
     from . import db
 
     result: dict[str, list[dict]] = {}
-    seen_by_ws: dict[str, set[str]] = {}
+    # Dedupe globally by composerId. Per-row ``composerData`` is authoritative
+    # in Cursor 3.x, so it is added first and wins; the legacy blob only fills
+    # in chats with no per-row entry. A composerId belongs to exactly one chat,
+    # so global dedup also stops a stale blob entry from duplicating a chat into
+    # a different workspace than its current per-row workspaceIdentifier.
+    seen: set[str] = set()
 
     def _add(entry: dict) -> None:
         cid = entry.get("composerId")
-        if not cid:
+        if not cid or cid in seen:
             return
+        seen.add(cid)
         wi = entry.get("workspaceIdentifier")
         ws_id = wi.get("id") if isinstance(wi, dict) else None
         ws_id = ws_id or UNASSIGNED_WS_ID
-        seen = seen_by_ws.setdefault(ws_id, set())
-        if cid in seen:
-            return
-        seen.add(cid)
         result.setdefault(ws_id, []).append(entry)
 
     global_db = get_global_db_path()
     if global_db.exists():
         try:
             with db.CursorDB(global_db) as cdb:
-                # Source 1: legacy ItemTable headers blob
-                blob = cdb.get_json("composer.composerHeaders", table="ItemTable")
-                if isinstance(blob, dict):
-                    for entry in blob.get("allComposers", []):
-                        if isinstance(entry, dict):
-                            _add(entry)
-
-                # Source 2: migrated per-row composerData entries
+                # Source 1 (authoritative): migrated per-row composerData entries
                 for key in cdb.list_keys("composerData:", table="cursorDiskKV"):
                     cd = cdb.get_json(key, table="cursorDiskKV")
                     if not isinstance(cd, dict):
@@ -347,6 +347,14 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
                         "forceMode": cd.get("forceMode", ""),
                         "workspaceIdentifier": cd.get("workspaceIdentifier"),
                     })
+
+                # Source 2 (fallback): legacy ItemTable headers blob, only for
+                # chats not present as per-row entries (names can be stale).
+                blob = cdb.get_json("composer.composerHeaders", table="ItemTable")
+                if isinstance(blob, dict):
+                    for entry in blob.get("allComposers", []):
+                        if isinstance(entry, dict):
+                            _add(entry)
         except Exception:
             pass
 
