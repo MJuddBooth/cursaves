@@ -279,29 +279,33 @@ UNASSIGNED_WS_ID = "unassigned"
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
 def _build_global_headers_map() -> dict[str, list[dict]]:
     """Build a workspace-hash → [composer header entries] map from the global index.
 
     Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
     Each value is a list of composer header dicts for that workspace.
 
-    Two sources are merged (deduplicated by composerId, with the authoritative
-    per-row source winning):
+    Three sources are merged, deduplicated by composerId, in descending order
+    of authority:
 
-      1. The per-row ``composerData:*`` entries in the global DB's
-         ``cursorDiskKV`` table. These are authoritative in Cursor 3.x and hold
-         the freshest ``name`` and ``workspaceIdentifier`` (e.g. after a chat is
-         moved or renamed), so they are processed FIRST and take precedence.
-         Newer Cursor builds migrate the header index out of the ItemTable blob
-         into these rows (flagged by
-         ``composer.composerHeaders.migratedToTable``), leaving the blob empty.
-         Without this source cursaves is blind to every chat that only lives
-         in the migrated table.
-      2. The legacy ``composer.composerHeaders`` ItemTable blob (pre-migration
-         Cursor 3.0 builds keep the whole index here). Used only as a fallback
-         for chats that have no per-row entry; its names/workspace can be stale.
+      1. The ``composerHeaders`` table (newest Cursor builds, flagged by
+         ``composer.composerHeaders.migratedToTable``). This is what Cursor's
+         own chat sidebar reads: it has a real ``workspaceId`` column that
+         Cursor keeps current. It is the only reliable source of workspace
+         membership, because Cursor no longer writes ``workspaceIdentifier``
+         into many ``composerData`` rows -- relying on those alone hides chats
+         that Cursor groups correctly.
+      2. The per-row ``composerData:*`` entries in ``cursorDiskKV``. Used for
+         chats absent from the table and to fill in fields it lacks.
+      3. The legacy ``composer.composerHeaders`` ItemTable blob (pre-migration
+         Cursor 3.0). Fallback only; its names/workspace can be stale.
 
-    Chats whose ``workspaceIdentifier`` is missing are grouped under the
+    Chats whose workspace is unknown from every source are grouped under the
     ``UNASSIGNED_WS_ID`` sentinel so they stay discoverable. Cached for the
     lifetime of the process.
     """
@@ -311,52 +315,109 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
 
     from . import db
 
-    result: dict[str, list[dict]] = {}
-    # Dedupe globally by composerId. Per-row ``composerData`` is authoritative
-    # in Cursor 3.x, so it is added first and wins; the legacy blob only fills
-    # in chats with no per-row entry. A composerId belongs to exactly one chat,
-    # so global dedup also stops a stale blob entry from duplicating a chat into
-    # a different workspace than its current per-row workspaceIdentifier.
-    seen: set[str] = set()
+    # composerId → merged entry. Higher-authority sources are processed first;
+    # lower ones only fill in fields that are still missing or empty, so a
+    # stale blob name can never override a live one.
+    merged: dict[str, dict] = {}
 
-    def _add(entry: dict) -> None:
+    def _merge(entry: dict, *, authoritative_workspace: bool) -> None:
         cid = entry.get("composerId")
-        if not cid or cid in seen:
+        # Cursor keeps non-chat rows here too (e.g. the "empty-state-draft"
+        # placeholder under an "empty-window" workspace); real chats are UUIDs.
+        if not cid or not _UUID_RE.match(str(cid)):
             return
-        seen.add(cid)
-        wi = entry.get("workspaceIdentifier")
-        ws_id = wi.get("id") if isinstance(wi, dict) else None
-        ws_id = ws_id or UNASSIGNED_WS_ID
-        result.setdefault(ws_id, []).append(entry)
+
+        current = merged.get(cid)
+        if current is None:
+            merged[cid] = dict(entry)
+            return
+
+        for key, value in entry.items():
+            if key == "workspaceIdentifier":
+                continue
+            if value and not current.get(key):
+                current[key] = value
+
+        incoming_ws = entry.get("workspaceIdentifier")
+        if incoming_ws and (
+            authoritative_workspace or not current.get("workspaceIdentifier")
+        ):
+            current["workspaceIdentifier"] = incoming_ws
 
     global_db = get_global_db_path()
     if global_db.exists():
         try:
             with db.CursorDB(global_db) as cdb:
-                # Source 1 (authoritative): migrated per-row composerData entries
+                # Source 1 (authoritative): Cursor's migrated composerHeaders table
+                for row in cdb.read_composer_headers():
+                    head = row.get("value") or {}
+                    ws_id = row.get("workspaceId")
+                    # Prefer the fully-formed identifier (it carries the folder
+                    # URI) but fall back to the bare hash from the column.
+                    ws_ident = head.get("workspaceIdentifier")
+                    if not isinstance(ws_ident, dict) or not ws_ident.get("id"):
+                        ws_ident = {"id": ws_id} if ws_id else None
+                    _merge(
+                        {
+                            "composerId": row.get("composerId"),
+                            "name": head.get("name", ""),
+                            "createdAt": row.get("createdAt") or head.get("createdAt", 0),
+                            # lastUpdatedAt is NULL for chats Cursor has not
+                            # touched since the migration; recency/createdAt
+                            # keep the listing from showing "unknown".
+                            "lastUpdatedAt": (
+                                row.get("lastUpdatedAt")
+                                or head.get("lastUpdatedAt")
+                                or row.get("recency")
+                                or row.get("createdAt")
+                                or 0
+                            ),
+                            "unifiedMode": head.get("unifiedMode", "agent"),
+                            "forceMode": head.get("forceMode", ""),
+                            "isArchived": bool(row.get("isArchived")),
+                            "isSubagent": bool(row.get("isSubagent")),
+                            "workspaceIdentifier": ws_ident,
+                        },
+                        authoritative_workspace=True,
+                    )
+
+                # Source 2: per-row composerData entries
                 for key in cdb.list_keys("composerData:", table="cursorDiskKV"):
                     cd = cdb.get_json(key, table="cursorDiskKV")
                     if not isinstance(cd, dict):
                         continue
-                    _add({
-                        "composerId": key[len("composerData:"):],
-                        "name": cd.get("name", ""),
-                        "createdAt": cd.get("createdAt", 0),
-                        "lastUpdatedAt": cd.get("lastUpdatedAt", 0),
-                        "unifiedMode": cd.get("unifiedMode", "agent"),
-                        "forceMode": cd.get("forceMode", ""),
-                        "workspaceIdentifier": cd.get("workspaceIdentifier"),
-                    })
+                    _merge(
+                        {
+                            "composerId": key[len("composerData:"):],
+                            "name": cd.get("name", ""),
+                            "createdAt": cd.get("createdAt", 0),
+                            "lastUpdatedAt": cd.get("lastUpdatedAt", 0),
+                            "unifiedMode": cd.get("unifiedMode", "agent"),
+                            "forceMode": cd.get("forceMode", ""),
+                            "workspaceIdentifier": cd.get("workspaceIdentifier"),
+                        },
+                        authoritative_workspace=False,
+                    )
 
-                # Source 2 (fallback): legacy ItemTable headers blob, only for
-                # chats not present as per-row entries (names can be stale).
+                # Source 3 (fallback): legacy ItemTable headers blob
                 blob = cdb.get_json("composer.composerHeaders", table="ItemTable")
                 if isinstance(blob, dict):
                     for entry in blob.get("allComposers", []):
                         if isinstance(entry, dict):
-                            _add(entry)
+                            _merge(entry, authoritative_workspace=False)
         except Exception:
             pass
+
+    result: dict[str, list[dict]] = {}
+    for entry in merged.values():
+        # Subagent chats are nested inside their parent conversation in Cursor's
+        # sidebar rather than listed as standalone chats, so they are not part
+        # of a workspace's conversation list.
+        if entry.get("isSubagent"):
+            continue
+        wi = entry.get("workspaceIdentifier")
+        ws_id = wi.get("id") if isinstance(wi, dict) else None
+        result.setdefault(ws_id or UNASSIGNED_WS_ID, []).append(entry)
 
     _global_headers_cache = result
     return result

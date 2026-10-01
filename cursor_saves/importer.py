@@ -191,18 +191,84 @@ def _init_workspace_db(db_path: Path):
     conn.close()
 
 
+USER_MESSAGE_TYPE = 1
+
+
+def _user_message_ids(headers: Optional[list]) -> set[str]:
+    """Return the bubble IDs of user-authored messages in a header list."""
+    return {
+        h.get("bubbleId")
+        for h in (headers or [])
+        if isinstance(h, dict)
+        and h.get("bubbleId")
+        and h.get("type") == USER_MESSAGE_TYPE
+    }
+
+
+def _server_bubble_ids(headers: Optional[list]) -> list[str]:
+    """Return the server-assigned message IDs, in conversation order.
+
+    Cursor stamps each message with both a local ``bubbleId`` and a
+    server-side ``serverBubbleId``. Only the latter survives a trip through
+    another machine: the local IDs are regenerated whenever an imported chat
+    is re-rendered, so they are useless for deciding ancestry.
+    """
+    return [
+        h["serverBubbleId"]
+        for h in (headers or [])
+        if isinstance(h, dict) and h.get("serverBubbleId")
+    ]
+
+
+def describe_divergence(
+    local_headers: Optional[list],
+    incoming_headers: Optional[list],
+) -> dict:
+    """Compare two header lists and locate their merge base.
+
+    Returns a dict with the length of the shared leading run of messages
+    (``ancestor``) plus the messages unique to each side (``local_only`` /
+    ``incoming_only``), counted by ``serverBubbleId``.
+    """
+    local_seq = _server_bubble_ids(local_headers)
+    incoming_seq = _server_bubble_ids(incoming_headers)
+    local_set, incoming_set = set(local_seq), set(incoming_seq)
+
+    ancestor = 0
+    for left, right in zip(local_seq, incoming_seq):
+        if left != right:
+            break
+        ancestor += 1
+
+    return {
+        "comparable": bool(local_seq and incoming_seq),
+        "local_total": len(local_seq),
+        "incoming_total": len(incoming_seq),
+        "ancestor": ancestor,
+        "local_only": len(local_set - incoming_set),
+        "incoming_only": len(incoming_set - local_set),
+        "local_tail": len(local_seq) - ancestor,
+        "incoming_tail": len(incoming_seq) - ancestor,
+    }
+
+
 def _check_conflict(
     global_db_path: Path,
     composer_id: str,
     incoming_bubble_ids: set[str],
     incoming_header_ids: Optional[set[str]] = None,
+    incoming_headers: Optional[list] = None,
 ) -> str:
     """Compare local chat state against incoming snapshot.
 
-    Compares both bubble IDs and conversation header IDs to determine
-    the relationship. This is necessary because bubbles can exist locally
-    (from a previous import) without being listed in the composerData
-    headers, making bubble-only comparison misleading.
+    Ancestry is determined from ``serverBubbleId`` when both sides carry it.
+    Cursor regenerates the local ``bubbleId`` of every assistant/tool message
+    whenever an imported chat is re-rendered, so comparing those makes any
+    round-tripped chat look "diverged" even when one side is a strict
+    continuation of the other. The server IDs are stable across machines.
+
+    Falls back to user-authored message IDs, then to raw bubble and header
+    IDs, when server IDs are unavailable on either side.
 
     Returns one of:
       "new"            - chat doesn't exist locally
@@ -224,6 +290,40 @@ def _check_conflict(
     if not incoming_bubble_ids:
         return "local_ahead"
 
+    local_headers = (local_data or {}).get("fullConversationHeadersOnly", [])
+
+    incoming_server_ids = set(_server_bubble_ids(incoming_headers))
+    local_server_ids = set(_server_bubble_ids(local_headers))
+
+    if incoming_server_ids and local_server_ids:
+        has_local_only = bool(local_server_ids - incoming_server_ids)
+        has_incoming_only = bool(incoming_server_ids - local_server_ids)
+
+        if not has_local_only and not has_incoming_only:
+            return "identical"
+        elif has_local_only and has_incoming_only:
+            return "diverged"
+        elif has_local_only:
+            return "local_ahead"
+        else:
+            return "incoming_newer"
+
+    incoming_user_ids = _user_message_ids(incoming_headers)
+    local_user_ids = _user_message_ids(local_headers)
+
+    if incoming_user_ids and local_user_ids:
+        has_local_only = bool(local_user_ids - incoming_user_ids)
+        has_incoming_only = bool(incoming_user_ids - local_user_ids)
+
+        if not has_local_only and not has_incoming_only:
+            return "identical"
+        elif has_local_only and has_incoming_only:
+            return "diverged"
+        elif has_local_only:
+            return "local_ahead"
+        else:
+            return "incoming_newer"
+
     prefix_len = len(f"bubbleId:{composer_id}:")
     local_bubble_ids = {k[prefix_len:] for k in local_keys}
 
@@ -231,12 +331,9 @@ def _check_conflict(
     incoming_only_bubbles = incoming_bubble_ids - local_bubble_ids
 
     # Also compare headers if provided
-    local_header_ids = set()
-    if local_data:
-        local_header_ids = {
-            h.get("bubbleId") for h in local_data.get("fullConversationHeadersOnly", [])
-            if h.get("bubbleId")
-        }
+    local_header_ids = {
+        h.get("bubbleId") for h in local_headers if h.get("bubbleId")
+    }
     incoming_only_headers = set()
     if incoming_header_ids:
         incoming_only_headers = incoming_header_ids - local_header_ids
@@ -313,6 +410,7 @@ def import_snapshot(
     }
     conflict = _check_conflict(
         global_db_path, composer_id, incoming_bubble_ids, incoming_header_ids,
+        incoming_headers=headers,
     )
     chat_name = composer_data.get("name", "Untitled")
     source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
@@ -917,6 +1015,52 @@ def _stamp_global_workspace_identifier(composer_id: str, ws_dir: Path) -> None:
     paths.invalidate_headers_cache()
 
 
+def _register_in_headers_table(
+    composer_id: str,
+    composer_data: dict,
+    ws_dir: Path,
+) -> bool:
+    """Insert the chat into Cursor's migrated ``composerHeaders`` table.
+
+    Newest Cursor builds drive the chat sidebar from this table's
+    ``workspaceId`` column. A chat that has a ``composerData`` row but no
+    header row is effectively invisible in the UI, so every import must
+    register here too. Returns False on older Cursor builds that have no
+    such table (nothing to do).
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return False
+
+    value = _build_composer_header_entry(composer_id, composer_data)
+    value["workspaceIdentifier"] = _target_workspace_identifier(ws_dir)
+    created = composer_data.get("createdAt") or 0
+    updated = composer_data.get("lastUpdatedAt") or created
+
+    gcdb = db.CursorDB(global_db_path)
+    try:
+        # upsert_composer_header() checks for the table on the write
+        # connection, so this never copies the (multi-GB) DB for a read.
+        registered = gcdb.upsert_composer_header({
+            "composerId": composer_id,
+            "workspaceId": ws_dir.name,
+            "createdAt": created,
+            "lastUpdatedAt": updated,
+            "isArchived": False,
+            "isSubagent": False,
+            "recency": updated,
+            "checkpointAt": None,
+            "value": value,
+            "subagentTypeName": "",
+        })
+    finally:
+        gcdb.close()
+
+    if registered:
+        paths.invalidate_headers_cache()
+    return registered
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
@@ -971,6 +1115,10 @@ def _register_in_workspace(
         # so without this an imported/copied chat would appear in the window
         # (via selectedComposerIds) yet be "unassigned" in the global index.
         _stamp_global_workspace_identifier(composer_id, ws_dir)
+
+        # Newest Cursor: the sidebar reads the composerHeaders table, so the
+        # chat needs a row there or it never shows up in the UI.
+        _register_in_headers_table(composer_id, composer_data, ws_dir)
 
         # Cursor 3.0+: register in the global headers index
         if is_migrated:
@@ -1820,6 +1968,11 @@ def purge_chats(
             keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
             total_keys += keys_deleted
 
+        # Remove from the migrated composerHeaders table. Skipping this leaves
+        # a header row with no body behind, which Cursor still renders in the
+        # sidebar as an unopenable ghost chat.
+        total_keys += write_cdb.delete_composer_headers(list(composer_ids))
+
         # Remove from composer.composerHeaders (global DB, ItemTable)
         headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers and "allComposers" in headers:
@@ -1983,6 +2136,16 @@ def move_chat(
                 continue
             _retag(cd)
             write_cdb.write_json(f"composerData:{cid}", cd)
+
+            # The migrated composerHeaders table is what Cursor's sidebar
+            # groups by, so the move only takes effect if its workspaceId
+            # column moves too.
+            write_cdb.set_composer_header_workspace(
+                cid,
+                to_ws_id,
+                workspace_identifier=target_wi,
+                clear_identifier=untag,
+            )
             moved += 1
 
         # Legacy ItemTable headers blob (pre-migration Cursor keeps it here).
