@@ -957,6 +957,52 @@ def _stamp_global_workspace_identifier(composer_id: str, ws_dir: Path) -> None:
     paths.invalidate_headers_cache()
 
 
+def _register_in_headers_table(
+    composer_id: str,
+    composer_data: dict,
+    ws_dir: Path,
+) -> bool:
+    """Insert the chat into Cursor's migrated ``composerHeaders`` table.
+
+    Newest Cursor builds drive the chat sidebar from this table's
+    ``workspaceId`` column. A chat that has a ``composerData`` row but no
+    header row is effectively invisible in the UI, so every import must
+    register here too. Returns False on older Cursor builds that have no
+    such table (nothing to do).
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return False
+
+    value = _build_composer_header_entry(composer_id, composer_data)
+    value["workspaceIdentifier"] = _target_workspace_identifier(ws_dir)
+    created = composer_data.get("createdAt") or 0
+    updated = composer_data.get("lastUpdatedAt") or created
+
+    gcdb = db.CursorDB(global_db_path)
+    try:
+        # upsert_composer_header() checks for the table on the write
+        # connection, so this never copies the (multi-GB) DB for a read.
+        registered = gcdb.upsert_composer_header({
+            "composerId": composer_id,
+            "workspaceId": ws_dir.name,
+            "createdAt": created,
+            "lastUpdatedAt": updated,
+            "isArchived": False,
+            "isSubagent": False,
+            "recency": updated,
+            "checkpointAt": None,
+            "value": value,
+            "subagentTypeName": "",
+        })
+    finally:
+        gcdb.close()
+
+    if registered:
+        paths.invalidate_headers_cache()
+    return registered
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
@@ -1011,6 +1057,10 @@ def _register_in_workspace(
         # so without this an imported/copied chat would appear in the window
         # (via selectedComposerIds) yet be "unassigned" in the global index.
         _stamp_global_workspace_identifier(composer_id, ws_dir)
+
+        # Newest Cursor: the sidebar reads the composerHeaders table, so the
+        # chat needs a row there or it never shows up in the UI.
+        _register_in_headers_table(composer_id, composer_data, ws_dir)
 
         # Cursor 3.0+: register in the global headers index
         if is_migrated:
@@ -1860,6 +1910,11 @@ def purge_chats(
             keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
             total_keys += keys_deleted
 
+        # Remove from the migrated composerHeaders table. Skipping this leaves
+        # a header row with no body behind, which Cursor still renders in the
+        # sidebar as an unopenable ghost chat.
+        total_keys += write_cdb.delete_composer_headers(list(composer_ids))
+
         # Remove from composer.composerHeaders (global DB, ItemTable)
         headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers and "allComposers" in headers:
@@ -2023,6 +2078,16 @@ def move_chat(
                 continue
             _retag(cd)
             write_cdb.write_json(f"composerData:{cid}", cd)
+
+            # The migrated composerHeaders table is what Cursor's sidebar
+            # groups by, so the move only takes effect if its workspaceId
+            # column moves too.
+            write_cdb.set_composer_header_workspace(
+                cid,
+                to_ws_id,
+                workspace_identifier=target_wi,
+                clear_identifier=untag,
+            )
             moved += 1
 
         # Legacy ItemTable headers blob (pre-migration Cursor keeps it here).
