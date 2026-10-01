@@ -8,6 +8,30 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+COMPOSER_HEADERS_TABLE = "composerHeaders"
+
+# Column order used for every composerHeaders read/write.
+_HEADER_COLUMNS = (
+    "composerId",
+    "workspaceId",
+    "createdAt",
+    "lastUpdatedAt",
+    "isArchived",
+    "isSubagent",
+    "recency",
+    "checkpointAt",
+    "value",
+    "subagentTypeName",
+)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,)
+    ).fetchone()
+    return row is not None
+
+
 class CursorDB:
     """Safe interface to a Cursor state.vscdb database.
 
@@ -156,6 +180,157 @@ class CursorDB:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
+
+    # ── composerHeaders table (Cursor's migrated chat index) ────────
+
+    def has_composer_headers_table(self) -> bool:
+        """True if this DB uses Cursor's migrated ``composerHeaders`` table.
+
+        Newer Cursor builds moved the chat index out of the
+        ``composer.composerHeaders`` ItemTable blob into a real table with a
+        ``workspaceId`` column, flagged by the
+        ``composer.composerHeaders.migratedToTable`` key.
+        """
+        try:
+            return _table_exists(self._ensure_read_copy(), COMPOSER_HEADERS_TABLE)
+        except (sqlite3.Error, FileNotFoundError):
+            return False
+
+    def read_composer_headers(self) -> list[dict]:
+        """Read every chat header from the ``composerHeaders`` table.
+
+        Each returned dict merges the row's columns with the parsed ``value``
+        JSON payload. ``workspaceId`` is the authoritative workspace hash --
+        Cursor keeps it current even when the per-chat ``composerData`` row
+        has no ``workspaceIdentifier`` at all.
+        """
+        try:
+            conn = self._ensure_read_copy()
+        except (sqlite3.Error, FileNotFoundError):
+            return []
+        try:
+            rows = conn.execute(
+                f"SELECT {', '.join(_HEADER_COLUMNS)} FROM {COMPOSER_HEADERS_TABLE}"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        out: list[dict] = []
+        for row in rows:
+            rec = dict(zip(_HEADER_COLUMNS, row))
+            raw = rec.pop("value", None)
+            try:
+                head = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                head = {}
+            if not isinstance(head, dict):
+                head = {}
+            rec["value"] = head
+            out.append(rec)
+        return out
+
+    def upsert_composer_header(self, header: dict) -> bool:
+        """Insert or replace one row in the ``composerHeaders`` table.
+
+        ``header`` uses the same shape returned by read_composer_headers():
+        column names plus a ``value`` dict. Returns False if this DB predates
+        the migrated table (nothing to do).
+        """
+        conn = self._get_write_conn()
+        if not _table_exists(conn, COMPOSER_HEADERS_TABLE):
+            return False
+
+        value = header.get("value") or {}
+        params = (
+            header.get("composerId"),
+            header.get("workspaceId"),
+            header.get("createdAt") or 0,
+            header.get("lastUpdatedAt") or 0,
+            int(bool(header.get("isArchived"))),
+            int(bool(header.get("isSubagent"))),
+            header.get("recency") or header.get("lastUpdatedAt") or 0,
+            header.get("checkpointAt"),
+            json.dumps(value, separators=(",", ":")),
+            header.get("subagentTypeName") or "",
+        )
+        placeholders = ",".join("?" for _ in _HEADER_COLUMNS)
+        conn.execute(
+            f"INSERT OR REPLACE INTO {COMPOSER_HEADERS_TABLE} "
+            f"({', '.join(_HEADER_COLUMNS)}) VALUES ({placeholders})",
+            params,
+        )
+        conn.commit()
+        return True
+
+    def set_composer_header_workspace(
+        self,
+        composer_id: str,
+        workspace_id: str,
+        workspace_identifier: Optional[dict] = None,
+        clear_identifier: bool = False,
+    ) -> bool:
+        """Retag one chat header to a different workspace.
+
+        Updates both the ``workspaceId`` column and the ``workspaceIdentifier``
+        embedded in the row's ``value`` JSON so Cursor and cursaves agree.
+        Pass ``clear_identifier`` to strip the embedded identifier instead
+        (used when untagging a chat to "unassigned").
+        Returns False if the table or the row is absent.
+        """
+        conn = self._get_write_conn()
+        if not _table_exists(conn, COMPOSER_HEADERS_TABLE):
+            return False
+
+        row = conn.execute(
+            f"SELECT value FROM {COMPOSER_HEADERS_TABLE} WHERE composerId = ?",
+            (composer_id,),
+        ).fetchone()
+        if row is None:
+            return False
+
+        try:
+            value = json.loads(row[0]) if row[0] else {}
+        except (json.JSONDecodeError, TypeError):
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        if clear_identifier:
+            value.pop("workspaceIdentifier", None)
+        else:
+            value["workspaceIdentifier"] = workspace_identifier or {"id": workspace_id}
+
+        conn.execute(
+            f"UPDATE {COMPOSER_HEADERS_TABLE} SET workspaceId = ?, value = ? "
+            "WHERE composerId = ?",
+            (workspace_id, json.dumps(value, separators=(",", ":")), composer_id),
+        )
+        conn.commit()
+        return True
+
+    def delete_composer_headers(self, composer_ids: list[str]) -> int:
+        """Delete rows from the ``composerHeaders`` table. Returns rows removed."""
+        if not composer_ids:
+            return 0
+        conn = self._get_write_conn()
+        if not _table_exists(conn, COMPOSER_HEADERS_TABLE):
+            return 0
+        total = 0
+        conn.execute("BEGIN")
+        try:
+            for start in range(0, len(composer_ids), 500):
+                batch = composer_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cur = conn.execute(
+                    f"DELETE FROM {COMPOSER_HEADERS_TABLE} "
+                    f"WHERE composerId IN ({placeholders})",
+                    batch,
+                )
+                total += cur.rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return total
 
     # ── Write operations (on original file) ─────────────────────────
 
