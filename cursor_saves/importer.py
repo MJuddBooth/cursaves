@@ -1915,6 +1915,36 @@ def list_all_chats_with_sizes() -> list[dict]:
                 "workspace_dir": cid_to_ws_dir.get(cid, ""),
             })
 
+        # Chats that exist only as a composerHeaders row, with no composerData
+        # body. Cursor still lists these in its sidebar, so they have to be
+        # purgeable -- otherwise `purge --empty` can never clear them and they
+        # linger as unopenable entries.
+        seen = {r["composerId"] for r in results}
+        for entries in headers_map.values():
+            for entry in entries:
+                cid = entry.get("composerId", "")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                bubble_count = bubble_counts.get(cid, 0)
+                checkpoint_count = checkpoint_counts.get(cid, 0)
+                results.append({
+                    "composerId": cid,
+                    "name": entry.get("name", ""),
+                    # With no body there is no header list to count. Report the
+                    # orphaned bubbles instead so a damaged-but-non-empty chat
+                    # is not swept up by --empty.
+                    "messageCount": bubble_count,
+                    # The 1 is the composerHeaders row itself, mirroring how a
+                    # normal chat counts its composerData row.
+                    "keyCount": 1 + bubble_count + checkpoint_count,
+                    "bubbleCount": bubble_count,
+                    "checkpointCount": checkpoint_count,
+                    "headerOnly": True,
+                    "workspace_label": cid_to_ws.get(cid, "unknown"),
+                    "workspace_dir": cid_to_ws_dir.get(cid, ""),
+                })
+
     results.sort(key=lambda x: x["keyCount"], reverse=True)
     return results
 
