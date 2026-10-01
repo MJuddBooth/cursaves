@@ -335,8 +335,62 @@ def cmd_init(args):
         print(f"  cursaves init --backend s3 --bucket my-cursor-saves")
 
 
+def _list_all_workspaces(args):
+    """List conversations for every workspace (``list -w all``)."""
+    workspaces = paths.list_workspaces_with_conversations()
+    if not workspaces:
+        print("No workspaces with conversations found.")
+        return
+
+    if args.json:
+        payload = []
+        for ws in workspaces:
+            payload.append({
+                "workspace": ws["path"],
+                "hash": ws["workspace_dir"].name,
+                "host": ws.get("host"),
+                "conversations": export.list_conversations(
+                    ws["path"], workspace_dir=ws["workspace_dir"]
+                ),
+            })
+        print(json.dumps(payload, indent=2))
+        return
+
+    total = 0
+    for idx, ws in enumerate(workspaces, 1):
+        conversations = export.list_conversations(
+            ws["path"], workspace_dir=ws["workspace_dir"]
+        )
+        host = ws.get("host")
+        label = f"{ws['path']} ({host})" if host else ws["path"]
+        print(f"[{idx}] {label}  {ws['workspace_dir'].name[:8]}")
+
+        if not conversations:
+            print("    (no conversations)\n")
+            continue
+
+        print(f"    {'ID':<38} {'Name':<30} {'Mode':<8} {'Msgs':>5}  {'Last Updated'}")
+        print("    " + "-" * 106)
+        for c in conversations:
+            name = c["name"]
+            if len(name) > 28:
+                name = name[:25] + "..."
+            print(
+                f"    {c['id']:<38} {name:<30} {c['mode']:<8} "
+                f"{c['messageCount']:>5}  {c['lastUpdated']}"
+            )
+        total += len(conversations)
+        print(f"    {len(conversations)} conversation(s)\n")
+
+    print(f"{total} conversation(s) across {len(workspaces)} workspace(s)")
+
+
 def cmd_list(args):
     """List conversations for the current project."""
+    if str(getattr(args, "workspace", "") or "").lower() == "all":
+        _list_all_workspaces(args)
+        return
+
     project_path, workspace_dir, _ = _resolve_project_and_workspace(args)
     conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
 
@@ -1616,6 +1670,9 @@ def cmd_purge(args):
         print("  No chats found.")
         return
 
+    if ws_filter and ws_filter.lower() == "all":
+        ws_filter = None  # `-w all` means every workspace, i.e. no filter
+
     if ws_filter:
         # Resolve like `list`/`push` do: accept a workspace number, hash, or
         # path. Fall back to a case-insensitive label substring match so the
@@ -1646,8 +1703,40 @@ def cmd_purge(args):
 
     empty_only = getattr(args, "empty", False)
     skip_confirm = getattr(args, "yes", False)
+    explicit_ids = [i for i in (getattr(args, "ids", None) or []) if i]
 
-    if empty_only:
+    if explicit_ids:
+        by_id = {c["composerId"]: c for c in all_chats}
+        selected_ids: list[str] = []
+        problems: list[str] = []
+        for query in explicit_ids:
+            if query in by_id:
+                matches = [query]
+            else:
+                matches = sorted(cid for cid in by_id if cid.startswith(query))
+            if not matches:
+                problems.append(f"  No chat matching ID '{query}'.")
+            elif len(matches) > 1:
+                problems.append(
+                    f"  ID '{query}' is ambiguous ({len(matches)} matches): "
+                    + ", ".join(m[:12] for m in matches[:5])
+                )
+            elif matches[0] not in selected_ids:
+                selected_ids.append(matches[0])
+
+        if problems:
+            for line in problems:
+                print(line)
+            return
+
+        print(f"  Selecting {len(selected_ids)} chat(s) by ID:")
+        for cid in selected_ids:
+            chat = by_id[cid]
+            print(
+                f"    {cid[:12]}  {chat['messageCount']:>5} msgs  "
+                f"{chat['name'] or '(untitled)'}"
+            )
+    elif empty_only:
         # Auto-select every chat with no messages; skip the interactive picker.
         selected_ids = [c["composerId"] for c in all_chats if c["messageCount"] == 0]
         if not selected_ids:
@@ -1822,7 +1911,8 @@ def main():
     def add_project_args(p):
         p.add_argument(
             "--workspace", "-w",
-            help="Workspace number, hash, or path substring from 'cursaves workspaces'",
+            help="Workspace number, hash, or path substring from 'cursaves workspaces' "
+                 "('all' lists every workspace)",
         )
         p.add_argument("--project", "-p", help="Project path (default: current directory)")
 
@@ -2077,8 +2167,14 @@ def main():
         "purge", help="Delete chats from Cursor's database to reclaim space"
     )
     p_purge.add_argument(
+        "ids", nargs="*",
+        help="Conversation ID(s) to delete (full or unique prefix). "
+             "Skips the interactive picker.",
+    )
+    p_purge.add_argument(
         "--workspace", "-w",
-        help="Filter to a workspace by number, hash, or path from 'cursaves workspaces' (also matches a name substring)",
+        help="Filter to a workspace by number, hash, or path from 'cursaves workspaces' "
+             "(also matches a name substring; 'all' means no filter)",
     )
     p_purge.add_argument(
         "--force", action="store_true",
