@@ -37,10 +37,17 @@ def get_workspace_conversations(
     seen_ids: set[str] = set()
     ids_needing_metadata: list[tuple[str, str]] = []  # (composerId, ws_dir_str)
     headers_map = paths._build_global_headers_map()
+    # The workspace's own lists can be stale (a moved chat stays in the old
+    # workspace's selected/pane lists), so only trust them for chats the
+    # global index does not assign to some other workspace.
+    owners = paths.header_owner_map()
 
     for ws_dir in ws_dirs:
         ws_hash = ws_dir.name
         ws_dir_str = str(ws_dir)
+
+        def _is_mine(cid: str, _ws_hash: str = ws_hash) -> bool:
+            return owners.get(cid, _ws_hash) == _ws_hash
 
         # Source 1: global headers (has full metadata inline)
         for entry in headers_map.get(ws_hash, []):
@@ -64,7 +71,7 @@ def get_workspace_conversations(
             # allComposers (Cursor 2.x — has full metadata)
             for c in data.get("allComposers", []):
                 cid = c.get("composerId")
-                if cid and cid not in seen_ids:
+                if cid and cid not in seen_ids and _is_mine(cid):
                     seen_ids.add(cid)
                     c["_workspaceDir"] = ws_dir_str
                     all_conversations.append(c)
@@ -72,10 +79,10 @@ def get_workspace_conversations(
             # selectedComposerIds + pane entries (need metadata lookup)
             extra_ids: set[str] = set()
             for cid in data.get("selectedComposerIds", []):
-                if cid and cid not in seen_ids:
+                if cid and cid not in seen_ids and _is_mine(cid):
                     extra_ids.add(cid)
             for cid in data.get("lastFocusedComposerIds", []):
-                if cid and cid not in seen_ids:
+                if cid and cid not in seen_ids and _is_mine(cid):
                     extra_ids.add(cid)
             for key in cdb.list_keys(
                 "workbench.panel.composerChatViewPane.", table="ItemTable"
@@ -85,7 +92,7 @@ def get_workspace_conversations(
                     for view_key in pane:
                         if ".view." in view_key:
                             cid = view_key.rsplit(".", 1)[-1]
-                            if cid and cid not in seen_ids:
+                            if cid and cid not in seen_ids and _is_mine(cid):
                                 extra_ids.add(cid)
 
             for cid in extra_ids:
