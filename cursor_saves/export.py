@@ -565,6 +565,14 @@ def export_conversation(
         # agent loop fails with "Blob not found" when continuing the chat.
         agent_blobs = _extract_agent_blobs(conv_data, _cdb, bubbles=bubbles)
 
+        # The sidebar row owns the archive state; record it so another
+        # machine can import the chat archived rather than as a live chat.
+        archived = None
+        for header in _cdb.read_composer_headers():
+            if header.get("composerId") == composer_id:
+                archived = bool(header.get("isArchived"))
+                break
+
         snapshot = {
             "version": 3,
             "exportedAt": datetime.now(timezone.utc).isoformat(),
@@ -573,6 +581,7 @@ def export_conversation(
             "sourceProjectPath": os.path.normpath(project_path),
             "projectIdentifier": paths.get_project_identifier(project_path),
             "composerId": composer_id,
+            "isArchived": archived,
             "composerData": conv_data,
             "contentBlobs": blobs,
             "bubbleEntries": bubbles,
@@ -682,6 +691,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "sourceProjectPath": snapshot.get("sourceProjectPath"),
         "projectIdentifier": snapshot.get("projectIdentifier"),
         "version": snapshot.get("version"),
+        "isArchived": snapshot.get("isArchived"),
         "shardCount": num_shards if num_shards else None,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"
