@@ -559,6 +559,45 @@ def cmd_list(args):
             print(f"{hidden} archived chat(s) not shown; use --archived to include them.")
 
 
+def cmd_lineage(args):
+    """Show chats that descend from the same conversation."""
+    from . import lineage
+
+    result = lineage.find_lineages(include_snapshots=args.snapshots)
+    families = result["families"]
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    if not families:
+        print("No chats share a conversation root.")
+        return
+
+    for n, family in enumerate(families, 1):
+        members = family["members"]
+        print(
+            f"[{n}] {len(members)} copies of one conversation "
+            f"({family['common_messages']} messages in common)"
+        )
+        print(f"    {'ID':<9} {'Name':<28} {'Where':<30} {'State':<22} {'Msgs':>5}  Relation")
+        print("    " + "-" * 118)
+        for m in members:
+            name = m["name"] if len(m["name"]) <= 26 else m["name"][:23] + "..."
+            where = m["where"] if len(m["where"]) <= 28 else m["where"][:25] + "..."
+            print(
+                f"    {m['id'][:8]:<9} {name:<28} {where:<30} {m['kind']:<22} "
+                f"{m['messages']:>5}  {m['relation']}"
+            )
+        print()
+
+    print(f"{len(families)} lineage(s) with more than one copy")
+    if result["unlinked"]:
+        print(f"{result['unlinked']} chat(s) had no server message IDs and could not be compared.")
+    if not args.snapshots:
+        print("Use --snapshots to also compare pulled snapshots that were never imported.")
+
+
 def cmd_export(args):
     """Export a single conversation to a snapshot file."""
     project_path = _resolve_project(args)
@@ -2802,6 +2841,19 @@ def main():
         help="Include archived chats (hidden by default, as in Cursor's sidebar)",
     )
     p_list.set_defaults(func=cmd_list)
+
+    # ── lineage ─────────────────────────────────────────────────────
+    p_lineage = subparsers.add_parser(
+        "lineage",
+        help="Find chats that are copies of the same conversation",
+    )
+    p_lineage.add_argument(
+        "--snapshots",
+        action="store_true",
+        help="Also compare snapshots in ~/.cursaves that differ from the local chat",
+    )
+    p_lineage.add_argument("--json", action="store_true", help="Output as JSON for scripting")
+    p_lineage.set_defaults(func=cmd_lineage)
 
     # ── export ──────────────────────────────────────────────────────
     p_export = subparsers.add_parser("export", help="Export a single conversation")
