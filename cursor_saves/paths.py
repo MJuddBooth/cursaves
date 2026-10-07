@@ -222,12 +222,28 @@ def get_project_path() -> str:
     return os.getcwd()
 
 
+_WORKSPACE_FILE_SUFFIX = ".code-workspace"
+
+
+def workspace_display_name(path: str) -> str:
+    """Short name for a workspace, the way Cursor's sidebar labels it.
+
+    A ``.code-workspace`` file is shown by its file name without the suffix;
+    a folder is shown by its own name.
+    """
+    name = os.path.basename(os.path.normpath(path)) if path else ""
+    if name.endswith(_WORKSPACE_FILE_SUFFIX):
+        name = name[: -len(_WORKSPACE_FILE_SUFFIX)]
+    return name or path
+
+
 def list_all_workspaces() -> list[dict]:
     """List all Cursor workspaces with metadata.
 
     Returns a list of dicts with:
       - folder_uri: raw URI from workspace.json
       - path: extracted filesystem path (for workspace, path to the .code-workspace file)
+      - name: short display name, as shown in Cursor's sidebar
       - type: 'local', 'ssh', or 'workspace'
       - host: SSH hostname (for ssh type, None otherwise)
       - workspace_dir: Path to the workspace directory
@@ -294,6 +310,7 @@ def list_all_workspaces() -> list[dict]:
             workspaces.append({
                 "folder_uri": folder_uri,
                 "path": os.path.normpath(folder_path),
+                "name": workspace_display_name(folder_path),
                 "type": ws_type,
                 "host": host,
                 "workspace_dir": ws_dir,
@@ -436,6 +453,10 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
                             "forceMode": head.get("forceMode", ""),
                             "isArchived": bool(row.get("isArchived")),
                             "isSubagent": bool(row.get("isSubagent")),
+                            "isDraft": bool(head.get("isDraft")),
+                            "isBestOfNSubcomposer": bool(
+                                head.get("isBestOfNSubcomposer")
+                            ),
                             "workspaceIdentifier": ws_ident,
                         },
                         authoritative_workspace=True,
@@ -470,10 +491,15 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
 
     result: dict[str, list[dict]] = {}
     for entry in merged.values():
-        # Subagent chats are nested inside their parent conversation in Cursor's
-        # sidebar rather than listed as standalone chats, so they are not part
-        # of a workspace's conversation list.
-        if entry.get("isSubagent"):
+        # Subagent chats and best-of-N candidates are nested inside their
+        # parent conversation in Cursor's sidebar, and drafts are unsent
+        # placeholders; none of them is a standalone chat, so none belongs in
+        # a workspace's conversation list.
+        if (
+            entry.get("isSubagent")
+            or entry.get("isBestOfNSubcomposer")
+            or entry.get("isDraft")
+        ):
             continue
         wi = entry.get("workspaceIdentifier")
         ws_id = wi.get("id") if isinstance(wi, dict) else None
@@ -576,6 +602,7 @@ def list_workspaces_with_conversations() -> list[dict]:
         if convos:
             covered_ws_ids.add(ws_hash)
             ws["conversations"] = len(convos)
+            ws["archived"] = sum(1 for c in convos if c.get("isArchived"))
             result.append(ws)
 
     # Global-index workspace hashes that have no workspaceStorage dir (e.g. the
@@ -584,17 +611,21 @@ def list_workspaces_with_conversations() -> list[dict]:
     for ws_id, entries in headers_map.items():
         if ws_id == UNASSIGNED_WS_ID or ws_id in covered_ws_ids:
             continue
-        count = len([e for e in entries if e.get("composerId")])
+        real = [e for e in entries if e.get("composerId")]
+        count = len(real)
         if not count:
             continue
+        label = f"(no workspace dir: {ws_id[:12]})"
         result.append({
             "folder_uri": "",
-            "path": f"(no workspace dir: {ws_id[:12]})",
+            "path": label,
+            "name": label,
             "type": "global",
             "host": None,
             "workspace_dir": get_workspace_storage_dir() / ws_id,
             "mtime": 0,
             "conversations": count,
+            "archived": sum(1 for e in real if e.get("isArchived")),
         })
 
     # Synthetic bucket for chats that carry no workspaceIdentifier at all.
@@ -603,11 +634,13 @@ def list_workspaces_with_conversations() -> list[dict]:
         result.append({
             "folder_uri": "",
             "path": "(global / unassigned)",
+            "name": "(global / unassigned)",
             "type": "global",
             "host": None,
             "workspace_dir": get_workspace_storage_dir() / UNASSIGNED_WS_ID,
             "mtime": 0,
             "conversations": len(unassigned),
+            "archived": sum(1 for e in unassigned if e.get("isArchived")),
         })
 
     return result
