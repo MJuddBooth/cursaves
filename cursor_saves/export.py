@@ -239,12 +239,19 @@ def format_timestamp(ts_ms: int) -> str:
 def list_conversations(
     project_path: str,
     workspace_dir: Optional[Path] = None,
+    include_archived: bool = True,
 ) -> list[dict]:
     """List all conversations for a project with display-friendly info.
 
-    Returns list of dicts with: id, name, date, mode, messageCount.
+    Returns list of dicts with: id, name, date, mode, messageCount, archived.
+
+    Archived chats are kept by default because sync operations must still see
+    them; pass ``include_archived=False`` for a listing that matches what
+    Cursor's sidebar shows.
     """
     conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
+    if not include_archived:
+        conversations = [c for c in conversations if not c.get("isArchived")]
     if not conversations:
         return []
 
@@ -269,6 +276,7 @@ def list_conversations(
                 "lastUpdated": format_timestamp(c.get("lastUpdatedAt", c.get("createdAt", 0))),
                 "mode": c.get("unifiedMode", c.get("forceMode", "unknown")),
                 "messageCount": msg_count,
+                "archived": bool(c.get("isArchived")),
             })
 
     return results
