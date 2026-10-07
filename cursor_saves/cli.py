@@ -168,27 +168,39 @@ def cmd_workspaces(args):
         print("No workspaces with conversations found.")
         return
 
-    print(f"{'#':<4} {'Type':<10} {'Path':<38} {'Host':<12} {'Chats':>5}  {'Hash':<9}  {'Sync Status'}")
-    print("-" * 115)
+    show_archived = bool(getattr(args, "archived", False))
+    print(
+        f"{'#':<4} {'Type':<10} {'Name':<30} {'Host':<12} {'Chats':>5} {'Arch':>5}  "
+        f"{'Hash':<9}  {'Sync Status':<30} {'Path'}"
+    )
+    print("-" * 140)
 
     global_db_path = paths.get_global_db_path()
     global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
     try:
         for i, ws in enumerate(workspaces, 1):
-            path = ws["path"]
-            if len(path) > 36:
-                path = "..." + path[-33:]
+            name = ws.get("name") or ws["path"]
+            if len(name) > 28:
+                name = name[:25] + "..."
             host = ws["host"] or ""
-            convos = ws.get("conversations", 0)
+            total = ws.get("conversations", 0)
+            archived = ws.get("archived", 0)
+            # The sidebar hides archived chats, so the default count excludes them.
+            chats = total if show_archived else total - archived
             sync = _workspace_sync_summary(ws, _global_cdb=global_cdb)
             ws_hash = ws["workspace_dir"].name[:8]
 
-            print(f"{i:<4} {ws['type']:<10} {path:<38} {host:<12} {convos:>5}  {ws_hash}  {sync}")
+            print(
+                f"{i:<4} {ws['type']:<10} {name:<30} {host:<12} {chats:>5} "
+                f"{archived or '':>5}  {ws_hash}  {sync:<30} {ws['path']}"
+            )
     finally:
         if global_cdb:
             global_cdb.close()
 
     print(f"\n{len(workspaces)} workspace(s) with conversations")
+    if not show_archived:
+        print("Chats excludes archived chats (shown under Arch); use --archived to include them.")
     print("\nUse 'cursaves push -w <number or hash>' to push a specific workspace.")
 
 
@@ -342,32 +354,46 @@ def _list_all_workspaces(args):
         print("No workspaces with conversations found.")
         return
 
+    include_archived = bool(getattr(args, "archived", False))
+
     if args.json:
         payload = []
         for ws in workspaces:
             payload.append({
                 "workspace": ws["path"],
+                "name": ws.get("name"),
                 "hash": ws["workspace_dir"].name,
                 "host": ws.get("host"),
                 "conversations": export.list_conversations(
-                    ws["path"], workspace_dir=ws["workspace_dir"]
+                    ws["path"],
+                    workspace_dir=ws["workspace_dir"],
+                    include_archived=include_archived,
                 ),
             })
         print(json.dumps(payload, indent=2))
         return
 
     total = 0
+    shown_workspaces = 0
+    hidden_archived = 0
+    # Numbers match `cursaves workspaces`, so a workspace skipped here keeps
+    # its number and `-w <number>` still refers to the same one.
     for idx, ws in enumerate(workspaces, 1):
         conversations = export.list_conversations(
-            ws["path"], workspace_dir=ws["workspace_dir"]
+            ws["path"],
+            workspace_dir=ws["workspace_dir"],
+            include_archived=include_archived,
         )
-        host = ws.get("host")
-        label = f"{ws['path']} ({host})" if host else ws["path"]
-        print(f"[{idx}] {label}  {ws['workspace_dir'].name[:8]}")
-
+        if not include_archived:
+            hidden_archived += ws.get("archived", 0)
         if not conversations:
-            print("    (no conversations)\n")
             continue
+
+        shown_workspaces += 1
+        host = ws.get("host")
+        name = ws.get("name") or ws["path"]
+        label = f"{name} ({host})" if host else name
+        print(f"[{idx}] {label}  {ws['workspace_dir'].name[:8]}  {ws['path']}")
 
         print(f"    {'ID':<38} {'Name':<30} {'Mode':<8} {'Msgs':>5}  {'Last Updated'}")
         print("    " + "-" * 106)
@@ -375,14 +401,17 @@ def _list_all_workspaces(args):
             name = c["name"]
             if len(name) > 28:
                 name = name[:25] + "..."
+            marker = "  [archived]" if c.get("archived") else ""
             print(
                 f"    {c['id']:<38} {name:<30} {c['mode']:<8} "
-                f"{c['messageCount']:>5}  {c['lastUpdated']}"
+                f"{c['messageCount']:>5}  {c['lastUpdated']}{marker}"
             )
         total += len(conversations)
         print(f"    {len(conversations)} conversation(s)\n")
 
-    print(f"{total} conversation(s) across {len(workspaces)} workspace(s)")
+    print(f"{total} conversation(s) across {shown_workspaces} workspace(s)")
+    if hidden_archived and not include_archived:
+        print(f"{hidden_archived} archived chat(s) not shown; use --archived to include them.")
 
 
 def cmd_list(args):
@@ -392,7 +421,10 @@ def cmd_list(args):
         return
 
     project_path, workspace_dir, _ = _resolve_project_and_workspace(args)
-    conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
+    include_archived = bool(getattr(args, "archived", False))
+    conversations = export.list_conversations(
+        project_path, workspace_dir=workspace_dir, include_archived=include_archived
+    )
 
     if not conversations:
         print(f"No conversations found for {project_path}", file=sys.stderr)
@@ -422,11 +454,23 @@ def cmd_list(args):
         name = c["name"]
         if len(name) > 28:
             name = name[:25] + "..."
+        marker = "  [archived]" if c.get("archived") else ""
         print(
-            f"{c['id']:<40} {name:<30} {c['mode']:<8} {c['messageCount']:>5}  {c['lastUpdated']}"
+            f"{c['id']:<40} {name:<30} {c['mode']:<8} {c['messageCount']:>5}  "
+            f"{c['lastUpdated']}{marker}"
         )
 
     print(f"\n{len(conversations)} conversation(s) total")
+    if not include_archived:
+        hidden = sum(
+            1
+            for c in export.get_workspace_conversations(
+                project_path, workspace_dir=workspace_dir
+            )
+            if c.get("isArchived")
+        )
+        if hidden:
+            print(f"{hidden} archived chat(s) not shown; use --archived to include them.")
 
 
 def cmd_export(args):
@@ -1947,6 +1991,11 @@ def main():
     p_workspaces = subparsers.add_parser(
         "workspaces", help="List all Cursor workspaces (local and SSH remote)"
     )
+    p_workspaces.add_argument(
+        "--archived",
+        action="store_true",
+        help="Count archived chats too (hidden by default, as in Cursor's sidebar)",
+    )
     p_workspaces.set_defaults(func=cmd_workspaces)
 
     # ── snapshots ──────────────────────────────────────────────────
@@ -1959,6 +2008,11 @@ def main():
     p_list = subparsers.add_parser("list", help="List conversations for a project")
     add_project_args(p_list)
     p_list.add_argument("--json", action="store_true", help="Output as JSON for scripting")
+    p_list.add_argument(
+        "--archived",
+        action="store_true",
+        help="Include archived chats (hidden by default, as in Cursor's sidebar)",
+    )
     p_list.set_defaults(func=cmd_list)
 
     # ── export ──────────────────────────────────────────────────────
