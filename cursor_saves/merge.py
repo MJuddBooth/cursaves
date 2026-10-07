@@ -376,21 +376,7 @@ def _clone_chat(
 
 def _update_header_row(wcdb: "db.CursorDB", composer_id: str, body: dict) -> None:
     """Refresh the sidebar row in place, keeping its archive state and workspace."""
-    for row in wcdb.read_composer_headers():
-        if row.get("composerId") != composer_id:
-            continue
-        updated = body.get("lastUpdatedAt") or row.get("lastUpdatedAt")
-        row["lastUpdatedAt"] = updated
-        row["recency"] = updated
-        value = row.get("value") or {}
-        value["lastUpdatedAt"] = updated
-        value["subtitle"] = body.get("subtitle", value.get("subtitle", ""))
-        value["totalLinesAdded"] = body.get("totalLinesAdded", 0)
-        value["totalLinesRemoved"] = body.get("totalLinesRemoved", 0)
-        value["filesChangedCount"] = body.get("filesChangedCount", 0)
-        row["value"] = value
-        wcdb.upsert_composer_header(row)
-        return
+    importer._refresh_header_row(wcdb, composer_id, body)
 
 
 def replace_chat(target: dict, source: dict, force: bool = False) -> dict:
