@@ -2295,6 +2295,23 @@ def cmd_delete(args):
 def cmd_doctor(args):
     """Audit and recover orphaned chats."""
     from .export import format_timestamp
+    from .importer import find_mistyped_identifiers, fix_mistyped_identifiers
+
+    if getattr(args, "fix_identifiers", False):
+        todo = find_mistyped_identifiers()
+        if not todo:
+            print("No mis-typed workspace identifiers found.")
+            return
+        print(f"Fixing the workspace identifier of {len(todo)} chat(s):")
+        for item in todo:
+            where = " + ".join(
+                part for part, bad in (("sidebar row", item["header"]), ("chat body", item["body"])) if bad
+            )
+            print(f"  {item['composerId'][:8]}  {(item['name'] or '(unnamed)')[:44]:<46} {where}")
+        fixed = fix_mistyped_identifiers(force=getattr(args, "force", False))
+        if fixed:
+            print(f"\nFixed {fixed} chat(s). Reopen Cursor to see them grouped by workspace.")
+        return
 
     audit = doctor_audit()
     storage = audit["storage"]
@@ -2315,6 +2332,15 @@ def cmd_doctor(args):
         f"  Orphaned (content):  {len(audit['orphaned'])}\n"
         f"  Empty stubs:         {audit['empty']}\n"
     )
+
+    mistyped = find_mistyped_identifiers()
+    if mistyped:
+        print(
+            f"  Mis-typed workspace identifiers: {len(mistyped)} chat(s) in a .code-workspace\n"
+            f"  workspace are tagged as a plain folder, so Cursor's sidebar groups them by\n"
+            f"  repository instead of by workspace. Close Cursor and run:\n"
+            f"      cursaves doctor --fix-identifiers\n"
+        )
 
     if audit["workspaces"]:
         print(
@@ -3231,6 +3257,11 @@ def main():
     p_doctor.add_argument(
         "--select", "-s", action="store_true",
         help="Interactively select which orphaned chats to recover",
+    )
+    p_doctor.add_argument(
+        "--fix-identifiers", action="store_true",
+        help="Retag chats in .code-workspace workspaces that are marked as plain folders "
+             "(makes Cursor group them by workspace, not by repository)",
     )
     p_doctor.add_argument(
         "--force", action="store_true",

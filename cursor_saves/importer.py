@@ -948,6 +948,13 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
 
     Reads workspace.json to get the folder URI and constructs the
     identifier format used by Cursor 3.0's composer.composerHeaders.
+
+    The two kinds of workspace use different keys, and Cursor tells them
+    apart by the key: a folder is ``{"id", "uri"}`` and a multi-root
+    ``.code-workspace`` file is ``{"id", "configPath"}``. Writing a workspace
+    file under ``uri`` makes Cursor treat it as a plain folder, which changes
+    how its sidebar groups the chat (by tracked repositories instead of by
+    workspace).
     """
     import json as _json
     ws_json = ws_dir / "workspace.json"
@@ -963,6 +970,7 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     folder_uri = data.get("folder", data.get("workspace", ""))
     if not folder_uri:
         return {"id": ws_hash}
+    is_workspace_file = bool(data.get("workspace")) and not data.get("folder")
 
     uri_obj: dict = {"$mid": 1}
     if folder_uri.startswith("file://"):
@@ -983,7 +991,31 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     else:
         return {"id": ws_hash}
 
-    return {"id": ws_hash, "uri": uri_obj}
+    return {"id": ws_hash, ("configPath" if is_workspace_file else "uri"): uri_obj}
+
+
+def _identifier_kind(wi: Optional[dict]) -> str:
+    """Classify a workspaceIdentifier: 'workspace', 'folder' or 'bare'."""
+    if not isinstance(wi, dict):
+        return "bare"
+    if "configPath" in wi:
+        return "workspace"
+    if "uri" in wi:
+        return "folder"
+    return "bare"
+
+
+def _workspace_kind(ws_dir: Path) -> Optional[str]:
+    """Whether a workspace dir is a '.code-workspace' file or a plain folder."""
+    try:
+        data = json.loads((ws_dir / "workspace.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("workspace") and not data.get("folder"):
+        return "workspace"
+    if data.get("folder"):
+        return "folder"
+    return None
 
 
 def _register_in_global_headers(
@@ -2114,11 +2146,18 @@ def _workspace_identifier_for_hash(ws_id: str) -> Optional[dict]:
     Falls back to constructing one from the target's workspace.json, and
     finally to a minimal ``{"id": ws_id}``.
     """
-    # 1) Reuse an existing chat's identifier for this workspace (most accurate).
+    # 1) Reuse an existing chat's identifier for this workspace -- but only
+    #    one of the right kind. A sibling written as a folder for what is really
+    #    a .code-workspace file is exactly the mistake to avoid copying.
+    expected = _workspace_kind(paths.get_workspace_storage_dir() / ws_id)
     headers_map = paths._build_global_headers_map()
     for e in headers_map.get(ws_id, []):
         wi = e.get("workspaceIdentifier")
-        if isinstance(wi, dict) and wi.get("id") == ws_id:
+        if (
+            isinstance(wi, dict)
+            and wi.get("id") == ws_id
+            and (expected is None or _identifier_kind(wi) == expected)
+        ):
             return json.loads(json.dumps(wi))
 
     # 2) Construct from the target workspace.json.
@@ -2141,6 +2180,87 @@ def _workspace_identifier_for_hash(ws_id: str) -> Optional[dict]:
 
     # 3) Minimal identifier (Cursor groups by id).
     return {"id": ws_id}
+
+
+def find_mistyped_identifiers() -> list[dict]:
+    """Find chats in .code-workspace workspaces tagged as if it were a folder.
+
+    Read-only. Cursor groups a chat by workspace only when its identifier
+    carries ``configPath``; a ``uri`` identifier on a workspace file makes it
+    fall back to grouping by tracked repositories.
+    """
+    global_db = paths.get_global_db_path()
+    if not global_db.exists():
+        return []
+    storage = paths.get_workspace_storage_dir()
+    kinds: dict[str, Optional[str]] = {}
+    found = []
+    with db.CursorDB(global_db) as cdb:
+        for row in cdb.read_composer_headers():
+            cid, ws_id = row.get("composerId"), row.get("workspaceId")
+            if not cid or not ws_id:
+                continue
+            if ws_id not in kinds:
+                kinds[ws_id] = _workspace_kind(storage / ws_id)
+            if kinds[ws_id] != "workspace":
+                continue
+            head = (row.get("value") or {}).get("workspaceIdentifier")
+            body = cdb.get_json(f"composerData:{cid}") or {}
+            header_bad = _identifier_kind(head) == "folder"
+            body_bad = _identifier_kind(body.get("workspaceIdentifier")) == "folder"
+            if header_bad or body_bad:
+                found.append({
+                    "composerId": cid,
+                    "name": (row.get("value") or {}).get("name") or body.get("name") or "",
+                    "workspaceId": ws_id,
+                    "header": header_bad,
+                    "body": body_bad,
+                })
+    return found
+
+
+def fix_mistyped_identifiers(force: bool = False) -> int:
+    """Rewrite mis-typed workspace identifiers to the ``configPath`` form.
+
+    Returns the number of chats fixed.
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0
+
+    todo = find_mistyped_identifiers()
+    if not todo:
+        return 0
+
+    global_db = paths.get_global_db_path()
+    backup = db.backup_db(global_db)
+    print(f"  Backed up global DB to {backup.name}")
+
+    storage = paths.get_workspace_storage_dir()
+    canonical: dict[str, dict] = {}
+    wcdb = db.CursorDB(global_db)
+    try:
+        for item in todo:
+            cid, ws_id = item["composerId"], item["workspaceId"]
+            if ws_id not in canonical:
+                canonical[ws_id] = _build_workspace_identifier(storage / ws_id)
+            wi = canonical[ws_id]
+            if item["header"]:
+                wcdb.set_composer_header_workspace(cid, ws_id, workspace_identifier=wi)
+            if item["body"]:
+                body = wcdb.get_json(f"composerData:{cid}")
+                if isinstance(body, dict):
+                    body["workspaceIdentifier"] = wi
+                    wcdb.write_json(f"composerData:{cid}", body)
+    finally:
+        wcdb.close()
+    paths.invalidate_headers_cache()
+    return len(todo)
 
 
 def move_chat(
