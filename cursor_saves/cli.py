@@ -2295,7 +2295,10 @@ def cmd_delete(args):
 def cmd_doctor(args):
     """Audit and recover orphaned chats."""
     from .export import format_timestamp
-    from .importer import find_mistyped_identifiers, fix_mistyped_identifiers
+    from .importer import (
+        find_mistyped_identifiers, fix_mistyped_identifiers,
+        find_stale_memberships, fix_stale_memberships,
+    )
 
     if getattr(args, "fix_identifiers", False):
         todo = find_mistyped_identifiers()
@@ -2311,6 +2314,20 @@ def cmd_doctor(args):
         fixed = fix_mistyped_identifiers(force=getattr(args, "force", False))
         if fixed:
             print(f"\nFixed {fixed} chat(s). Reopen Cursor to see them grouped by workspace.")
+        return
+
+    if getattr(args, "fix_memberships", False):
+        todo = find_stale_memberships()
+        if not todo:
+            print("No stale workspace memberships found.")
+            return
+        total = sum(len(i["composerIds"]) for i in todo)
+        print(f"Removing {total} stale chat reference(s) from {len(todo)} workspace(s):")
+        for item in todo:
+            print(f"  workspace {item['workspaceId'][:8]}: " + ", ".join(c[:8] for c in item["composerIds"]))
+        removed = fix_stale_memberships(force=getattr(args, "force", False))
+        if removed:
+            print(f"\nRemoved {removed} list entr{'y' if removed == 1 else 'ies'}. Reopen Cursor.")
         return
 
     audit = doctor_audit()
@@ -2340,6 +2357,16 @@ def cmd_doctor(args):
             f"  workspace are tagged as a plain folder, so Cursor's sidebar groups them by\n"
             f"  repository instead of by workspace. Close Cursor and run:\n"
             f"      cursaves doctor --fix-identifiers\n"
+        )
+
+    stale = find_stale_memberships()
+    if stale:
+        n = sum(len(i["composerIds"]) for i in stale)
+        print(
+            f"  Stale workspace memberships: {n} chat reference(s) in {len(stale)} workspace(s)\n"
+            f"  point at chats that now belong to another workspace (typically after a\n"
+            f"  move). Close Cursor and run:\n"
+            f"      cursaves doctor --fix-memberships\n"
         )
 
     if audit["workspaces"]:
@@ -3262,6 +3289,11 @@ def main():
         "--fix-identifiers", action="store_true",
         help="Retag chats in .code-workspace workspaces that are marked as plain folders "
              "(makes Cursor group them by workspace, not by repository)",
+    )
+    p_doctor.add_argument(
+        "--fix-memberships", action="store_true",
+        help="Remove chats from workspaces they no longer belong to (clears the "
+             "leftovers a move used to leave behind)",
     )
     p_doctor.add_argument(
         "--force", action="store_true",
