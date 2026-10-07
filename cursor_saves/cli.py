@@ -512,6 +512,111 @@ def cmd_lineage(args):
         print("Use --snapshots to also compare pulled snapshots that were never imported.")
 
 
+def cmd_merge(args):
+    """Reconcile two copies of one conversation (preview, add context, or replace)."""
+    from . import merge
+
+    if bool(args.source) == bool(args.from_snapshot):
+        print("Error: give exactly one of --from CHAT or --from-snapshot ID_OR_FILE.", file=sys.stderr)
+        sys.exit(1)
+
+    global_db = paths.get_global_db_path()
+    try:
+        with db.CursorDB(global_db) as cdb:
+            target = merge.load_chat_source(args.target, cdb)
+            source = (
+                merge.load_chat_source(args.source, cdb)
+                if args.source
+                else merge.load_snapshot_source(args.from_snapshot)
+            )
+            if source["kind"] == "chat" and source["id"] == target["id"]:
+                raise merge.MergeError("Target and source are the same chat.")
+            plan = merge.plan_merge(target["headers"], source["headers"])
+
+            if source["kind"] == "chat":
+                def get_bubble(bubble_id):
+                    return cdb.get_json(f"bubbleId:{source['id']}:{bubble_id}")
+            else:
+                entries = source["snapshot"].get("bubbleEntries") or {}
+                def get_bubble(bubble_id):
+                    return entries.get(bubble_id)
+
+            _print_merge_preview(target, source, plan, get_bubble, mode=args.mode)
+
+            if not args.mode or args.dry_run:
+                if not args.mode:
+                    print("\nNo --mode given, so nothing was changed.")
+                    print("  --mode context   write the source-only messages as a markdown transcript")
+                    print("  --mode replace   overwrite the target with the source (keeps the old version)")
+                return
+
+            if args.mode == "context":
+                if not plan["tail"]:
+                    print("\nThe source has nothing the target lacks; no context file written.")
+                    return
+                out, count = merge.write_context(
+                    target, source, plan, get_bubble, out_dir=args.out
+                )
+                size = out.stat().st_size
+                print(
+                    f"\nWrote {count} message(s) of context to:\n  {out}\n"
+                    f"  ({size / 1024:.0f} KB, roughly {size // 4:,} tokens)"
+                )
+                print("Attach it to the target chat with @ (or drag it in) to give the "
+                      "model that branch as reference.")
+                return
+    except merge.MergeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # replace: opens its own connections, so run it outside the read connection
+    print("\nReplacing...")
+    try:
+        result = merge.replace_chat(target, source, force=args.force)
+    except merge.MergeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(
+        f"\nDone: \"{target['name']}\" now has {result['messages']} messages "
+        f"({result['bubbles']} bubbles)."
+    )
+    print(f"Previous version kept as \"{result['copy_name']}\".")
+    print("Reopen Cursor to see the result.")
+
+
+def _print_merge_preview(target, source, plan, get_bubble, mode=None):
+    from . import merge
+
+    def describe(label, side):
+        print(f"  {label:<8} \"{side['name']}\" ({side['id'][:8]})  "
+              f"{len(side['headers'])} messages  [{side['origin']}]")
+
+    print("Merge preview")
+    describe("target", target)
+    describe("source", source)
+    print(f"  common   first {plan['ancestor']} messages")
+    print(f"  only in target: {plan['target_only']}    only in source: {len(plan['tail'])}")
+    print(f"  relation: {plan['relation']}")
+
+    shown = 0
+    for header in plan["tail"]:
+        bubble = get_bubble(header.get("bubbleId", ""))
+        item = merge._classify(bubble) if bubble else None
+        if item and item[0] == "user":
+            if shown == 0:
+                print("\n  First messages only in the source:")
+            print(f"    - {merge._one_line(item[1], 100)}")
+            shown += 1
+            if shown == 3:
+                break
+
+    if mode != "context" and plan["target_only"] and plan["tail"]:
+        print(
+            f"\n  Note: replace discards the target's {plan['target_only']} own message(s) "
+            "from that chat (they stay in the preserved copy)."
+        )
+
+
 def cmd_export(args):
     """Export a single conversation to a snapshot file."""
     project_path = _resolve_project(args)
@@ -2066,6 +2171,26 @@ def main():
     )
     p_lineage.add_argument("--json", action="store_true", help="Output as JSON for scripting")
     p_lineage.set_defaults(func=cmd_lineage)
+
+    # ── merge ───────────────────────────────────────────────────────
+    p_merge = subparsers.add_parser(
+        "merge",
+        help="Reconcile two copies of one conversation (preview, add context, or replace)",
+    )
+    p_merge.add_argument("target", help="Chat to merge into (ID or unique prefix)")
+    p_merge.add_argument("--from", dest="source", metavar="CHAT",
+                         help="Source: another local chat (ID or unique prefix)")
+    p_merge.add_argument("--from-snapshot", metavar="ID_OR_FILE",
+                         help="Source: a snapshot, by composer ID in ~/.cursaves or by file path")
+    p_merge.add_argument("--mode", choices=["context", "replace"],
+                         help="context: write a transcript of the source-only messages; "
+                              "replace: overwrite the target with the source. "
+                              "Omit to preview only.")
+    p_merge.add_argument("--dry-run", action="store_true", help="Preview even when --mode is given")
+    p_merge.add_argument("--out", help="Directory for the context file (default: ~/.cursaves/context)")
+    p_merge.add_argument("--force", action="store_true",
+                         help="Replace even if Cursor is running (not recommended)")
+    p_merge.set_defaults(func=cmd_merge)
 
     # ── export ──────────────────────────────────────────────────────
     p_export = subparsers.add_parser("export", help="Export a single conversation")
