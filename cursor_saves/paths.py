@@ -509,6 +509,26 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
     return result
 
 
+def header_owner_map() -> dict[str, str]:
+    """composerId -> owning workspace hash, for chats with a real owner.
+
+    The global header index is authoritative for where a chat lives. A
+    workspace's own lists (selected/focused tabs, allComposers, chat panes)
+    can be stale, e.g. after a move, so callers use this to ignore a
+    workspace's claim on a chat that the index assigns elsewhere. Chats the
+    index leaves unassigned are absent, so such claims still count for them.
+    """
+    owners: dict[str, str] = {}
+    for ws_id, entries in _build_global_headers_map().items():
+        if ws_id == UNASSIGNED_WS_ID:
+            continue
+        for entry in entries:
+            cid = entry.get("composerId")
+            if cid:
+                owners[cid] = ws_id
+    return owners
+
+
 def invalidate_headers_cache():
     """Clear the cached global headers map (call after writing to the global DB)."""
     global _global_headers_cache
@@ -540,7 +560,15 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
         if cid:
             ids.add(cid)
 
-    # Source 2+3: workspace DB
+    # Source 2+3: workspace DB. These lists can be stale (a moved chat stays in
+    # the old workspace's selected/pane lists), so a claim is ignored when the
+    # global index assigns the chat to a different workspace.
+    owners = header_owner_map()
+
+    def claim(cid: str) -> None:
+        if owners.get(cid, ws_hash) == ws_hash:
+            ids.add(cid)
+
     try:
         with db.CursorDB(ws_db_path) as cdb:
             data = cdb.get_json("composer.composerData", table="ItemTable")
@@ -551,15 +579,15 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
             for c in data.get("allComposers", []):
                 cid = c.get("composerId")
                 if cid:
-                    ids.add(cid)
+                    claim(cid)
 
             # Cursor 3.0+: supplementary sources for chats not in global index
             for cid in data.get("selectedComposerIds", []):
                 if cid:
-                    ids.add(cid)
+                    claim(cid)
             for cid in data.get("lastFocusedComposerIds", []):
                 if cid:
-                    ids.add(cid)
+                    claim(cid)
 
             for key in cdb.list_keys(
                 "workbench.panel.composerChatViewPane.", table="ItemTable"
@@ -570,7 +598,7 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
                         if ".view." in view_key:
                             cid = view_key.rsplit(".", 1)[-1]
                             if cid:
-                                ids.add(cid)
+                                claim(cid)
     except Exception:
         pass
 

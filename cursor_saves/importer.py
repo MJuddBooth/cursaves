@@ -2263,6 +2263,116 @@ def fix_mistyped_identifiers(force: bool = False) -> int:
     return len(todo)
 
 
+_MEMBERSHIP_LISTS = ("selectedComposerIds", "lastFocusedComposerIds")
+
+
+def find_stale_memberships(
+    only_ids: Optional[set] = None, keep_ws_id: Optional[str] = None
+) -> list[dict]:
+    """Chats a workspace still lists although the global index puts them elsewhere.
+
+    Each workspace keeps its own ``composer.composerData`` lists (selected and
+    focused tabs, legacy ``allComposers``). Moving a chat retags the global
+    rows but used to leave these lists alone, so the old workspace kept
+    claiming the chat. Read-only.
+
+    ``only_ids`` limits the scan to those chats and also treats a chat that
+    now has no real owner (moved to "unassigned") as stale everywhere, except
+    in ``keep_ws_id`` (the move target, which is never stale).
+    Returns ``[{workspaceId, composerIds, ...}]``, one item per workspace.
+    """
+    storage = paths.get_workspace_storage_dir()
+    if not storage.exists():
+        return []
+    owners = paths.header_owner_map()
+
+    def stale(cid: str, ws_hash: str) -> bool:
+        if only_ids is not None and cid not in only_ids:
+            return False
+        if ws_hash == keep_ws_id:
+            return False
+        owner = owners.get(cid)
+        if owner is None:
+            return only_ids is not None
+        return owner != ws_hash
+
+    found = []
+    for ws_dir in sorted(storage.iterdir()):
+        db_path = ws_dir / "state.vscdb"
+        if not db_path.exists():
+            continue
+        try:
+            with db.CursorDB(db_path) as cdb:
+                data = cdb.get_json("composer.composerData", table="ItemTable")
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        claimed = set()
+        for key in _MEMBERSHIP_LISTS:
+            claimed.update(c for c in data.get(key) or [] if c)
+        claimed.update(
+            c.get("composerId") for c in data.get("allComposers") or []
+            if isinstance(c, dict) and c.get("composerId")
+        )
+        bad = sorted(c for c in claimed if stale(c, ws_dir.name))
+        if bad:
+            found.append({"workspaceId": ws_dir.name, "composerIds": bad})
+    return found
+
+
+def _prune_memberships(items: list[dict]) -> int:
+    """Remove the chats in ``find_stale_memberships`` items from each workspace's lists."""
+    removed = 0
+    storage = paths.get_workspace_storage_dir()
+    for item in items:
+        drop = set(item["composerIds"])
+        if not drop:
+            continue
+        db_path = storage / item["workspaceId"] / "state.vscdb"
+        backup = db.backup_db(db_path)
+        print(f"  Backed up workspace {item['workspaceId'][:8]} DB to {backup.name}")
+        wdb = db.CursorDB(db_path)
+        try:
+            data = wdb.get_json("composer.composerData", table="ItemTable")
+            if not isinstance(data, dict):
+                continue
+            before = removed
+            for key in _MEMBERSHIP_LISTS:
+                if isinstance(data.get(key), list):
+                    kept = [c for c in data[key] if c not in drop]
+                    removed += len(data[key]) - len(kept)
+                    data[key] = kept
+            if isinstance(data.get("allComposers"), list):
+                kept = [
+                    c for c in data["allComposers"]
+                    if not (isinstance(c, dict) and c.get("composerId") in drop)
+                ]
+                removed += len(data["allComposers"]) - len(kept)
+                data["allComposers"] = kept
+            if removed != before:
+                wdb.write_json("composer.composerData", data, table="ItemTable")
+        finally:
+            wdb.close()
+    return removed
+
+
+def fix_stale_memberships(force: bool = False) -> int:
+    """Drop chats from workspaces that the global index says they no longer belong to.
+
+    Returns the number of list entries removed.
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0
+    return _prune_memberships(find_stale_memberships())
+
+
 def move_chat(
     composer_ids: list[str],
     to_ws_id: str,
@@ -2354,4 +2464,10 @@ def move_chat(
         write_cdb.close()
 
     paths.invalidate_headers_cache()
+
+    # The source workspace's own lists (open/focused tabs, allComposers) still
+    # name the chat; clear them or it keeps showing up there.
+    _prune_memberships(
+        find_stale_memberships(only_ids=cid_set, keep_ws_id=None if untag else to_ws_id)
+    )
     return moved, skipped
