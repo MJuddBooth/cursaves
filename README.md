@@ -348,6 +348,7 @@ All commands default to the current working directory as the project path. Use `
 | **`config git`** | **Set/show commit identity for ~/.cursaves/**             | No                    |
 | **`push`**     | **Checkpoint + push to remote**                             | No                    |
 | **`push -s`**  | **Interactively select which conversations to push**        | No                    |
+| **`push --id`** | **Push just the chat(s) with this ID (or unique prefix)**   | No                    |
 | **`pull`**     | **Pull from remote + import snapshots**                     | Yes                   |
 | `setup`        | Interactive first-run wizard (GitHub login, profile, hook) | No                    |
 | `init`         | Initialize sync repo (git remote or S3 bucket)              | No                    |
@@ -366,7 +367,7 @@ All commands default to the current working directory as the project path. Use `
 | `migrate`      | Migrate old chats to Cursor 3.0 global index                | Yes                   |
 | `purge`        | Delete chats from Cursor's DB to reclaim disk space         | Yes                   |
 
-Most of the time you only need `sync`. On a new machine, run `cursaves auth github` once, then `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
+Most of the time you only need `sync`. On a new machine, run `cursaves auth github` once, then `sync`. Use `push -s` when you want to pick conversations from a list, or `push --id a39071a0` (repeatable, any unique prefix of the chat ID) when you already know which one you want; it finds the chat's workspace itself, so it works from any directory. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
 
 ### Git sync troubleshooting
 

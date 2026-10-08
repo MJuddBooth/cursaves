@@ -1720,12 +1720,74 @@ def cmd_sync(args):
         print("Already in sync.")
 
 
+def _push_chats_by_id(args, backend, snapshots_dir) -> None:
+    """Push only the chats named with --id, wherever they live.
+
+    Each selector is a full composer ID or a unique prefix. The chat's own
+    workspace decides which project its snapshot is filed under, so this works
+    from any directory. A chat with no workspace (unassigned) is filed under
+    the project given by -p/-w, or the current directory.
+    """
+    from . import merge
+
+    items = []
+    seen = set()
+    with db.CursorDB(paths.get_global_db_path()) as cdb:
+        for selector in args.chat_ids:
+            try:
+                composer_id = merge.resolve_chat_id(selector, cdb)
+            except merge.MergeError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if composer_id in seen:
+                continue
+            seen.add(composer_id)
+
+            where, _ws_dir, ws = merge._workspace_label(composer_id)
+            if ws is not None:
+                project_path, source_host = ws["path"], ws.get("host")
+            else:
+                project_path, _wd, source_host = _resolve_project_and_workspace(args)
+                where = f"unassigned, filed under {os.path.basename(project_path) or project_path}"
+            data = cdb.get_json(f"composerData:{composer_id}") or {}
+            msgs = len(data.get("fullConversationHeadersOnly", []))
+            name = data.get("name") or "Untitled"
+            print(f"  {composer_id[:8]}  {name[:44]:<46} {msgs:>5} msgs  [{where}]")
+            items.append((composer_id, project_path, source_host))
+
+    print(f"\nCheckpointing {len(items)} conversation(s)...")
+    saved = export.checkpoint_conversations(items)
+    if not saved:
+        print("Nothing to checkpoint (the chat has no data).")
+        return
+    print(f"  {len(saved)} conversation(s) checkpointed")
+
+    if backend.has_remote():
+        print("  Pushing...", end="", flush=True)
+        if backend.push(snapshots_dir):
+            print(" done")
+        else:
+            print(" failed", file=sys.stderr)
+    else:
+        print("  No remote configured, skipping push")
+
+    print(f"\nDone. {len(saved)} conversation(s) saved.")
+
+
 def cmd_push(args):
     """Checkpoint + push in one command."""
     _configure_git_verbose(args)
     sync_dir = _require_sync_repo()
     backend = get_backend()
     snapshots_dir = paths.get_snapshots_dir()
+
+    if getattr(args, "chat_ids", None) and (
+        getattr(args, "select", False)
+        or getattr(args, "all_chats", False)
+        or getattr(args, "ahead", False)
+    ):
+        print("Error: --id cannot be combined with --select, --all or --ahead.", file=sys.stderr)
+        sys.exit(2)
 
     if getattr(args, "ahead", False):
         _push_ahead(sync_dir, backend=backend)
@@ -1735,6 +1797,10 @@ def cmd_push(args):
     if backend.has_remote():
         if not backend.pull(snapshots_dir):
             print("Warning: Could not sync with remote, continuing anyway...", file=sys.stderr)
+
+    if getattr(args, "chat_ids", None):
+        _push_chats_by_id(args, backend, snapshots_dir)
+        return
 
     # Resolve workspace and select conversations
     composer_ids = None
@@ -3073,6 +3139,12 @@ def main():
     p_push.add_argument(
         "--all", dest="all_chats", action="store_true",
         help="Push all conversations without selection prompt",
+    )
+    p_push.add_argument(
+        "--id", "--ID", dest="chat_ids", action="append", metavar="CHAT",
+        help="Push just this chat (full composer ID or unique prefix); repeat the "
+             "flag to push more than one. Finds the chat's workspace itself, so "
+             "no -w or -s is needed",
     )
     p_push.add_argument(
         "--ahead", "-a", action="store_true",
