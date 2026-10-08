@@ -700,6 +700,28 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     return snapshot_file
 
 
+def checkpoint_conversations(
+    items: list[tuple[str, str, Optional[str]]],
+) -> list[Path]:
+    """Export specific conversations to snapshots/, without scanning workspaces.
+
+    ``items`` is ``[(composer_id, project_path, source_host), ...]``. Each chat
+    is exported under its own project path, so chats from different workspaces
+    can be pushed together. Returns the saved snapshot paths; a chat with no
+    data is skipped.
+    """
+    snapshots_dir = paths.get_snapshots_dir()
+    saved = []
+    with db.CursorDB(paths.get_global_db_path()) as cdb:
+        for composer_id, project_path, source_host in items:
+            snapshot = export_conversation(
+                project_path, composer_id, _cdb=cdb, source_host=source_host
+            )
+            if snapshot:
+                saved.append(save_snapshot(snapshot, snapshots_dir))
+    return saved
+
+
 def checkpoint_project(
     project_path: str,
     composer_ids: Optional[list[str]] = None,
