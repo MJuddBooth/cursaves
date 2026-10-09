@@ -23,6 +23,7 @@ from .importer import (
     import_snapshot,
     list_snapshot_projects,
     list_snapshot_files,
+    split_empty_snapshots,
     read_snapshot_file,
     read_snapshot_meta,
     repair_missing_blobs,
@@ -1415,7 +1416,7 @@ def cmd_pull(args):
         total_failure = 0
         for project in [selected_project["_project"]]:
             # Build snapshot list for this project
-            snapshot_files = list_snapshot_files(project["path"])
+            snapshot_files, _empty = split_empty_snapshots(list_snapshot_files(project["path"]))
             snapshots_info = []
             for sf in snapshot_files:
                 meta = read_snapshot_meta(sf)
@@ -1666,6 +1667,41 @@ def cmd_delete(args):
         # Sync deletion to remote
         hostname = paths.get_machine_id()
         if _commit_and_push(sync_dir, f"[{hostname}] delete all snapshots"):
+            print("Synced to remote.")
+        return
+
+    # --empty: delete every snapshot with 0 messages, across all projects
+    if args.empty:
+        found = []
+        for p in list_snapshot_projects(snapshots_base):
+            _kept, empty_files = split_empty_snapshots(list_snapshot_files(p["path"]))
+            found.extend((p["name"], sf) for sf in empty_files)
+        if not found:
+            print("No empty snapshots found.")
+            return
+
+        print(f"Found {len(found)} empty (0-message) snapshot(s):")
+        for project_name, sf in found:
+            meta = read_snapshot_meta(sf)
+            host = meta.get("sourceHost") or meta.get("sourceMachine") or "unknown"
+            print(f"  {project_name}/{_get_snapshot_id(sf)[:12]}  from {host}")
+
+        if not args.yes:
+            try:
+                confirm = input("\nDelete these? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if confirm not in ("y", "yes"):
+                print("Cancelled.")
+                return
+
+        for _name, sf in found:
+            _delete_snapshot(sf)
+        print(f"\nDeleted {len(found)} empty snapshot(s).")
+
+        hostname = paths.get_machine_id()
+        if _commit_and_push(sync_dir, f"[{hostname}] delete {len(found)} empty snapshot(s)"):
             print("Synced to remote.")
         return
 
@@ -2419,6 +2455,10 @@ def main():
     p_delete.add_argument(
         "--all-projects", action="store_true",
         help="Delete ALL snapshots across ALL projects",
+    )
+    p_delete.add_argument(
+        "--empty", action="store_true",
+        help="Delete every empty (0-message) snapshot across all projects",
     )
     p_delete.add_argument(
         "--yes", "-y", action="store_true",

@@ -481,9 +481,10 @@ def import_snapshot(
 
     composer_data = snapshot["composerData"]
 
-    # Skip empty conversations (new-but-never-used chats)
+    # Skip empty conversations (new-but-never-used chats, or chats whose
+    # messages were all removed). They carry nothing worth importing.
     headers = composer_data.get("fullConversationHeadersOnly", [])
-    if not headers and not composer_data.get("name"):
+    if not headers:
         print(f"  Skipping empty conversation {composer_id[:12]}...")
         return True  # Not an error, just nothing to import
 
@@ -804,6 +805,24 @@ def format_sync_status(status: str) -> str:
     return _SYNC_STATUS_LABELS.get(status, status)
 
 
+def is_empty_snapshot_meta(meta: dict) -> bool:
+    """True if snapshot metadata describes a chat with no messages.
+
+    Metadata that could not be read (``exportedAt`` missing) is never treated
+    as empty, so a damaged snapshot is not mistaken for an empty one.
+    """
+    return bool(meta.get("exportedAt")) and not meta.get("messageCount")
+
+
+def split_empty_snapshots(files: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Split snapshot files into (non_empty, empty) using their metadata."""
+    kept: list[Path] = []
+    empty: list[Path] = []
+    for sf in files:
+        (empty if is_empty_snapshot_meta(read_snapshot_meta(sf)) else kept).append(sf)
+    return kept, empty
+
+
 def list_snapshot_projects(snapshots_dir: Optional[Path] = None) -> list[dict]:
     """List all project directories in the snapshots store.
 
@@ -927,7 +946,12 @@ def import_from_snapshot_dir(
         )
         return 0, 0
 
-    snapshot_files = list_snapshot_files(snapshot_dir)
+    snapshot_files, empty_files = split_empty_snapshots(list_snapshot_files(snapshot_dir))
+    if empty_files:
+        print(
+            f"Skipping {len(empty_files)} empty snapshot(s) "
+            f"(remove them with 'cursaves delete --empty')."
+        )
     if not snapshot_files:
         return 0, 0
 
