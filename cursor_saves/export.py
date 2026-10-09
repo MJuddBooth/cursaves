@@ -700,6 +700,11 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     return snapshot_file
 
 
+def _has_messages(snapshot: dict) -> bool:
+    """False for chats with no messages; those are not worth syncing."""
+    return bool(snapshot.get("composerData", {}).get("fullConversationHeadersOnly"))
+
+
 def checkpoint_conversations(
     items: list[tuple[str, str, Optional[str]]],
 ) -> list[Path]:
@@ -717,7 +722,7 @@ def checkpoint_conversations(
             snapshot = export_conversation(
                 project_path, composer_id, _cdb=cdb, source_host=source_host
             )
-            if snapshot:
+            if snapshot and _has_messages(snapshot):
                 saved.append(save_snapshot(snapshot, snapshots_dir))
     return saved
 
@@ -762,7 +767,7 @@ def checkpoint_project(
         for i, (c, composer_id) in enumerate(to_process, 1):
             # Export the conversation
             snapshot = export_conversation(project_path, composer_id, _cdb=cdb, source_host=source_host)
-            if snapshot:
+            if snapshot and _has_messages(snapshot):
                 path = save_snapshot(snapshot, snapshots_dir)
                 saved.append(path)
             
