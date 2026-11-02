@@ -635,7 +635,7 @@ def cmd_export(args):
 
     # Show summary
     data = snapshot["composerData"]
-    headers = data.get("fullConversationHeadersOnly", [])
+    headers = db.snapshot_headers(snapshot)
     blobs = snapshot.get("contentBlobs", {})
     print(f"  Messages: {len(headers)}")
     print(f"  Content blobs: {len(blobs)}")
@@ -1246,7 +1246,7 @@ def _push_chats_by_id(args, backend, snapshots_dir) -> None:
                 project_path, _wd, source_host = _resolve_project_and_workspace(args)
                 where = f"unassigned, filed under {os.path.basename(project_path) or project_path}"
             data = cdb.get_json(f"composerData:{composer_id}") or {}
-            msgs = len(data.get("fullConversationHeadersOnly", []))
+            msgs = len(cdb.get_conversation_headers(composer_id, data))
             name = data.get("name") or "Untitled"
             print(f"  {composer_id[:8]}  {name[:44]:<46} {msgs:>5} msgs  [{where}]")
             items.append((composer_id, project_path, source_host))

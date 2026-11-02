@@ -42,7 +42,7 @@ def _collect_local(names: dict[str, str]) -> list[dict]:
             body = cdb.get_json(key, table="cursorDiskKV")
             if not isinstance(body, dict):
                 continue
-            seq = _server_bubble_ids(body.get("fullConversationHeadersOnly"))
+            seq = _server_bubble_ids(cdb.get_conversation_headers(cid, body))
             info = meta.get(cid, {})
             ws_id = info.get("_ws", "")
             members.append({
@@ -71,7 +71,7 @@ def _collect_snapshots(local_seqs: dict[str, list[str]]) -> list[dict]:
                 continue
             body = snap.get("composerData") or {}
             cid = snap.get("composerId") or body.get("composerId") or snap_path.stem
-            seq = _server_bubble_ids(body.get("fullConversationHeadersOnly"))
+            seq = _server_bubble_ids(db.snapshot_headers(snap))
             if cid in local_seqs and local_seqs[cid] == seq:
                 continue
             members.append({

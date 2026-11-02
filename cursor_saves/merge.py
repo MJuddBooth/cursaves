@@ -85,7 +85,8 @@ def load_chat_source(selector: str, cdb: "db.CursorDB") -> dict:
         "kind": "chat",
         "id": composer_id,
         "name": body.get("name") or "(unnamed)",
-        "headers": body.get("fullConversationHeadersOnly") or [],
+        "headers": cdb.get_conversation_headers(composer_id, body),
+        "headerChunks": cdb.get_header_chunks(composer_id),
         "where": where,
         "origin": f"chat in {where}",
         "composerData": body,
@@ -143,7 +144,8 @@ def load_snapshot_source(selector: str) -> dict:
         "kind": "snapshot",
         "id": snap.get("composerId") or body.get("composerId"),
         "name": body.get("name") or "(unnamed)",
-        "headers": body.get("fullConversationHeadersOnly") or [],
+        "headers": db.snapshot_headers(snap),
+        "headerChunks": snap.get(db.SNAPSHOT_CHUNKS_KEY) or {},
         "where": machine,
         "origin": f"snapshot from {machine} ({exported_at[:16]})",
         "composerData": body,
@@ -294,7 +296,12 @@ def write_context(
 
 # ── Replace mode ─────────────────────────────────────────────────────────
 
-_PER_CHAT_PREFIXES = ("bubbleId:", "checkpointId:", "messageRequestContext:")
+_PER_CHAT_PREFIXES = (
+    "bubbleId:",
+    "checkpointId:",
+    "messageRequestContext:",
+    db.CONV_HEADERS_PREFIX,
+)
 
 
 def _read_prefixed(cdb: "db.CursorDB", prefix: str) -> dict:
@@ -311,6 +318,7 @@ def _chat_payload(cdb: "db.CursorDB", composer_id: str) -> dict:
         "bubbles": _read_prefixed(cdb, f"bubbleId:{composer_id}:"),
         "checkpoints": _read_prefixed(cdb, f"checkpointId:{composer_id}:"),
         "contexts": _read_prefixed(cdb, f"messageRequestContext:{composer_id}:"),
+        "headerChunks": cdb.get_header_chunks(composer_id),
         "contentBlobs": {},
         "agentBlobs": {},
     }
@@ -321,6 +329,7 @@ def _snapshot_payload(snap: dict) -> dict:
         "bubbles": snap.get("bubbleEntries") or {},
         "checkpoints": snap.get("checkpoints") or {},
         "contexts": snap.get("messageContexts") or {},
+        "headerChunks": snap.get(db.SNAPSHOT_CHUNKS_KEY) or {},
         "contentBlobs": snap.get("contentBlobs") or {},
         "agentBlobs": snap.get("agentBlobs") or {},
     }
@@ -337,6 +346,11 @@ def _write_payload(wcdb: "db.CursorDB", composer_id: str, payload: dict) -> None
         wcdb.write_json_batch([
             (f"messageRequestContext:{composer_id}:{k}", v)
             for k, v in payload["contexts"].items()
+        ])
+    if payload.get("headerChunks"):
+        wcdb.write_json_batch([
+            (f"{db.CONV_HEADERS_PREFIX}{composer_id}:{k}", v)
+            for k, v in payload["headerChunks"].items()
         ])
     if payload["bubbles"]:
         wcdb.write_json_batch([
@@ -436,6 +450,11 @@ def replace_chat(target: dict, source: dict, force: bool = False) -> dict:
             if target_body.get(key) is not None:
                 new_body[key] = target_body[key]
 
+        # Store the message list the way the local Cursor does.
+        new_body, payload["headerChunks"] = importer._apply_header_form(
+            rcdb, new_body, source["headers"], payload.get("headerChunks") or {}
+        )
+
         removed = 0
         for prefix in _PER_CHAT_PREFIXES:
             removed += wcdb.delete_keys_by_prefix(f"{prefix}{target['id']}:")
@@ -450,7 +469,7 @@ def replace_chat(target: dict, source: dict, force: bool = False) -> dict:
     verify = db.CursorDB(global_db)
     try:
         written = verify.get_json(f"composerData:{target['id']}") or {}
-        count = len(written.get("fullConversationHeadersOnly") or [])
+        count = len(verify.get_conversation_headers(target["id"], written))
         bubbles = len(verify.list_keys(f"bubbleId:{target['id']}:"))
     finally:
         verify.close()
