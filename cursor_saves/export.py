@@ -270,11 +270,7 @@ def list_conversations(
         for c in conversations:
             composer_id = c.get("composerId", "unknown")
 
-            msg_count = 0
-            conv_data = cdb.get_json(f"composerData:{composer_id}")
-            if conv_data:
-                headers = conv_data.get("fullConversationHeadersOnly", [])
-                msg_count = len(headers)
+            msg_count = len(cdb.get_conversation_headers(composer_id))
 
             results.append({
                 "id": composer_id,
@@ -524,6 +520,16 @@ def export_conversation(
         if not conv_data:
             return None
 
+        # Message list. Newer Cursor keeps it in composerConvHeaders chunk
+        # rows and leaves composerData's list empty; keep the raw chunks and
+        # also write the full list back into the exported composerData so
+        # every reader of a snapshot sees the real messages.
+        header_chunks = _cdb.get_header_chunks(composer_id)
+        conv_data = dict(conv_data)
+        conv_data["fullConversationHeadersOnly"] = _cdb.get_conversation_headers(
+            composer_id, conv_data
+        )
+
         # Bubble entries (individual message content)
         bubbles = {}
         for key in _cdb.list_keys(f"bubbleId:{composer_id}:"):
@@ -585,6 +591,7 @@ def export_conversation(
             "composerData": conv_data,
             "contentBlobs": blobs,
             "bubbleEntries": bubbles,
+            db.SNAPSHOT_CHUNKS_KEY: header_chunks,
             "checkpoints": checkpoints,
             "agentBlobs": agent_blobs,
             "transcript": get_transcript(project_path, composer_id),
@@ -684,7 +691,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     meta = {
         "composerId": composer_id,
         "name": cd.get("name"),
-        "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+        "messageCount": len(db.snapshot_headers(snapshot)),
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),

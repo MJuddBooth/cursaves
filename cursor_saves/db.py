@@ -10,6 +10,10 @@ from typing import Any, Optional
 
 COMPOSER_HEADERS_TABLE = "composerHeaders"
 
+# Newer Cursor keeps each chat's message list in rows with this key prefix:
+# composerConvHeaders:<composerId>:<6-digit chunk number> -> JSON list of headers.
+CONV_HEADERS_PREFIX = "composerConvHeaders:"
+
 # Column order used for every composerHeaders read/write.
 _HEADER_COLUMNS = (
     "composerId",
@@ -23,6 +27,30 @@ _HEADER_COLUMNS = (
     "value",
     "subagentTypeName",
 )
+
+
+# Snapshot key holding {chunk suffix: header list}; same name the
+# awasilyev/cursaves fork uses so snapshots stay interchangeable.
+SNAPSHOT_CHUNKS_KEY = "conversationHeaderChunks"
+
+
+def snapshot_headers(snapshot: dict) -> list[dict]:
+    """The ordered message headers recorded in a snapshot dict.
+
+    Snapshots exported by this version carry the full list in
+    ``composerData.fullConversationHeadersOnly`` *and* the raw chunk rows.
+    Snapshots from forks may carry only the chunks.
+    """
+    chunks = snapshot.get(SNAPSHOT_CHUNKS_KEY) or {}
+    if chunks:
+        return [
+            h
+            for suffix in sorted(chunks)
+            for h in (chunks[suffix] or [])
+            if isinstance(h, dict)
+        ]
+    cd = snapshot.get("composerData") or {}
+    return list(cd.get("fullConversationHeadersOnly") or [])
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -170,6 +198,60 @@ class CursorDB:
         except sqlite3.OperationalError:
             pass
         return result
+
+    # ── conversation header list (legacy list or chunked rows) ──────
+
+    def conv_header_chunk_keys(self, composer_id: str) -> list[str]:
+        """Keys of a chat's ``composerConvHeaders`` chunk rows, in order."""
+        return sorted(self.list_keys(f"{CONV_HEADERS_PREFIX}{composer_id}:"))
+
+    def get_header_chunks(self, composer_id: str) -> dict[str, list]:
+        """Raw chunk rows for a chat as ``{chunk suffix: header list}``."""
+        prefix = f"{CONV_HEADERS_PREFIX}{composer_id}:"
+        out = {}
+        for key in self.conv_header_chunk_keys(composer_id):
+            part = self.get_json(key)
+            if isinstance(part, list):
+                out[key[len(prefix):]] = part
+        return out
+
+    def uses_chunked_headers(self) -> bool:
+        """True once Cursor has written any ``composerConvHeaders`` row here.
+
+        Newer Cursor builds keep each chat's message list in chunk rows rather
+        than in ``composerData.fullConversationHeadersOnly``. This tells whether
+        the local Cursor is one of them.
+        """
+        conn = self._ensure_read_copy()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM cursorDiskKV WHERE key LIKE ? LIMIT 1",
+                (CONV_HEADERS_PREFIX + "%",),
+            ).fetchone()
+            return row is not None
+        except sqlite3.OperationalError:
+            return False
+
+    def get_conversation_headers(
+        self, composer_id: str, composer_data: Optional[dict] = None
+    ) -> list[dict]:
+        """The chat's ordered message headers, however Cursor stored them.
+
+        Newer Cursor builds empty ``fullConversationHeadersOnly`` and keep the
+        list in ``composerConvHeaders:<id>:<NNNNNN>`` rows (256 per chunk,
+        pointed at by ``composerData.headerLog``). Older builds, and chats not
+        touched since, still have the plain list. Chunks win when present.
+        """
+        chunks = []
+        for key in self.conv_header_chunk_keys(composer_id):
+            part = self.get_json(key)
+            if isinstance(part, list):
+                chunks.append(part)
+        if chunks:
+            return [h for part in chunks for h in part if isinstance(h, dict)]
+        if composer_data is None:
+            composer_data = self.get_json(f"composerData:{composer_id}")
+        return list((composer_data or {}).get("fullConversationHeadersOnly") or [])
 
     def get_json(self, key: str, table: str = "cursorDiskKV") -> Optional[Any]:
         """Get and parse a JSON value."""
