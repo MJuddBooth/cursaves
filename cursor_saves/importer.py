@@ -82,7 +82,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
         return {
             "composerId": data.get("composerId"),
             "name": cd.get("name"),
-            "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+            "messageCount": len(db.snapshot_headers(data)),
             "exportedAt": data.get("exportedAt"),
             "sourceMachine": data.get("sourceMachine"),
             "sourceHost": data.get("sourceHost"),
@@ -283,14 +283,13 @@ def _check_conflict_by_ids(
     with db.CursorDB(global_db_path) as cdb:
         local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
         local_data = cdb.get_json(f"composerData:{composer_id}")
+        local_headers = cdb.get_conversation_headers(composer_id, local_data)
 
     if not local_keys:
         return "new"
 
     if not incoming_bubble_ids:
         return "local_ahead"
-
-    local_headers = (local_data or {}).get("fullConversationHeadersOnly", [])
 
     incoming_server_ids = set(_server_bubble_ids(incoming_headers))
     local_server_ids = set(_server_bubble_ids(local_headers))
@@ -397,8 +396,7 @@ def _check_conflict(
         return verdict
 
     with db.CursorDB(global_db_path) as cdb:
-        local_data = cdb.get_json(f"composerData:{composer_id}")
-        local_headers = (local_data or {}).get("fullConversationHeadersOnly", [])
+        local_headers = cdb.get_conversation_headers(composer_id)
         if len(local_headers) == len(incoming_headers):
             return verdict
 
@@ -422,6 +420,25 @@ def _check_conflict(
     if short_sigs != long_sigs or not any(sig[1] or sig[2] for sig in short_sigs):
         return verdict
     return "incoming_newer" if shorter_is_local else "local_ahead"
+
+
+def _apply_header_form(
+    cdb: "db.CursorDB", body: dict, headers: list, chunks: dict
+) -> tuple[dict, dict]:
+    """Pick how the local Cursor should store a chat's message list.
+
+    Returns ``(body, chunks_to_write)``. If we hold chunk rows and the local
+    Cursor already uses them, keep them (and empty the list, as Cursor does);
+    otherwise store the plain list and drop the pointer to chunks that will
+    not exist. Never both, or a stale one would shadow the other.
+    """
+    body = dict(body)
+    if chunks and cdb.uses_chunked_headers():
+        body["fullConversationHeadersOnly"] = []
+        return body, chunks
+    body["fullConversationHeadersOnly"] = headers
+    body.pop("headerLog", None)
+    return body, {}
 
 
 def _refresh_header_row(wcdb: "db.CursorDB", composer_id: str, body: dict) -> bool:
@@ -471,7 +488,7 @@ def import_snapshot(
         print(f"Error reading snapshot: {e}", file=sys.stderr)
         return False
 
-    if snapshot.get("version") not in (1, 2, 3):
+    if snapshot.get("version") not in (1, 2, 3, 4):
         print(f"Error: Unsupported snapshot version: {snapshot.get('version')}", file=sys.stderr)
         return False
 
@@ -482,7 +499,8 @@ def import_snapshot(
     composer_data = snapshot["composerData"]
 
     # Skip empty conversations (new-but-never-used chats)
-    headers = composer_data.get("fullConversationHeadersOnly", [])
+    headers = db.snapshot_headers(snapshot)
+    header_chunks = snapshot.get(db.SNAPSHOT_CHUNKS_KEY) or {}
     if not headers and not composer_data.get("name"):
         print(f"  Skipping empty conversation {composer_id[:12]}...")
         return True  # Not an error, just nothing to import
@@ -513,8 +531,7 @@ def import_snapshot(
 
     if conflict == "local_ahead":
         with db.CursorDB(global_db_path) as cdb:
-            ld = cdb.get_json(f"composerData:{composer_id}")
-        local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
+            local_count = len(cdb.get_conversation_headers(composer_id))
         snap_count = len(headers)
         print(
             f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
@@ -531,8 +548,7 @@ def import_snapshot(
 
     if conflict == "incoming_newer":
         with db.CursorDB(global_db_path) as cdb:
-            ld = cdb.get_json(f"composerData:{composer_id}")
-        local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
+            local_count = len(cdb.get_conversation_headers(composer_id))
         snap_count = len(headers)
         print(
             f"  Updating: \"{chat_name}\" — local has {local_count} msgs, "
@@ -567,6 +583,12 @@ def import_snapshot(
             else:
                 composer_data.pop(key, None)
 
+    # Store the message list the way the local Cursor does.
+    with db.CursorDB(global_db_path) as cdb:
+        composer_data, header_chunks = _apply_header_form(
+            cdb, composer_data, headers, header_chunks
+        )
+
     # ── Step 1: Backup global DB ────────────────────────────────────
     if not skip_backup and global_db_path.exists():
         backup_path = db.backup_db(global_db_path)
@@ -577,6 +599,15 @@ def import_snapshot(
     try:
         # Write the main conversation data
         global_cdb.write_json(f"composerData:{composer_id}", composer_data)
+
+        # Replace any chunk rows already here for this chat
+        chunk_prefix = f"{db.CONV_HEADERS_PREFIX}{composer_id}:"
+        global_cdb.delete_keys_by_prefix(chunk_prefix)
+        if header_chunks:
+            global_cdb.write_json_batch([
+                (f"{chunk_prefix}{suffix}", part)
+                for suffix, part in header_chunks.items()
+            ])
 
         # Write content blobs
         if content_blobs:
@@ -684,7 +715,7 @@ def _verify_import(
                 return False
 
         final_name = composer_data.get("name", chat_name)
-        final_msgs = len(written.get("fullConversationHeadersOnly", []))
+        final_msgs = len(verify_cdb.get_conversation_headers(composer_id, written))
         if conflict == "new":
             print(f"  Imported: \"{final_name}\" ({final_msgs} msgs, {len(bubble_entries)} bubbles)")
         elif conflict == "diverged":
@@ -719,17 +750,17 @@ def get_sync_status_for_snapshot(
     """
     if _cdb is not None:
         local_data = _cdb.get_json(f"composerData:{composer_id}")
+        local_count = len(_cdb.get_conversation_headers(composer_id, local_data))
     else:
         global_db_path = paths.get_global_db_path()
         if not global_db_path.exists():
             return "not_local"
         with db.CursorDB(global_db_path) as cdb:
             local_data = cdb.get_json(f"composerData:{composer_id}")
+            local_count = len(cdb.get_conversation_headers(composer_id, local_data))
 
     if not local_data:
         return "not_local"
-
-    local_count = len(local_data.get("fullConversationHeadersOnly", []))
 
     if local_count == snapshot_msg_count:
         return "up_to_date"
@@ -772,15 +803,15 @@ def get_push_status_for_conversation(
 
     if _cdb is not None:
         local_data = _cdb.get_json(f"composerData:{composer_id}")
+        local_count = len(_cdb.get_conversation_headers(composer_id, local_data))
     else:
         global_db_path = paths.get_global_db_path()
         with db.CursorDB(global_db_path) as cdb:
             local_data = cdb.get_json(f"composerData:{composer_id}")
+            local_count = len(cdb.get_conversation_headers(composer_id, local_data))
 
     if not local_data:
         return "never_pushed"
-
-    local_count = len(local_data.get("fullConversationHeadersOnly", []))
 
     if local_count == snapshot_count:
         return "up_to_date"
@@ -1378,6 +1409,14 @@ def copy_between_workspaces(
                 new_data = rewrite_paths(new_data, source_norm, target_norm)
             write_cdb.write_json(f"composerData:{new_id}", new_data)
 
+            # Copy the message-list chunk rows newer Cursor builds use
+            chunks = read_cdb.get_header_chunks(old_id)
+            if chunks:
+                write_cdb.write_json_batch([
+                    (f"{db.CONV_HEADERS_PREFIX}{new_id}:{suffix}", part)
+                    for suffix, part in chunks.items()
+                ])
+
             # Copy bubble entries
             bubble_keys = read_cdb.list_keys(f"bubbleId:{old_id}:")
             if bubble_keys:
@@ -1671,7 +1710,7 @@ def doctor_audit() -> dict:
                 continue
 
             name = cd.get("name") or ""
-            msgs = len(cd.get("fullConversationHeadersOnly", []))
+            msgs = len(cdb.get_conversation_headers(cid, cd))
 
             if cid in registered_ids:
                 registered_count += 1
@@ -1958,7 +1997,7 @@ def migrate_to_global_headers(
                 cd = read_cdb.get_json(f"composerData:{cid}")
                 if not cd:
                     continue
-                msgs = len(cd.get("fullConversationHeadersOnly", []))
+                msgs = len(read_cdb.get_conversation_headers(cid, cd))
                 if msgs == 0 and not cd.get("name"):
                     continue
                 entry = _build_composer_header_entry(cid, cd)
@@ -2076,7 +2115,7 @@ def list_all_chats_with_sizes() -> list[dict]:
             cd = gcdb.get_json(key)
             if not cd:
                 continue
-            msgs = len(cd.get("fullConversationHeadersOnly", []))
+            msgs = len(gcdb.get_conversation_headers(cid, cd))
             name = cd.get("name", "")
             bubble_count = bubble_counts.get(cid, 0)
             checkpoint_count = checkpoint_counts.get(cid, 0)
@@ -2172,6 +2211,9 @@ def purge_chats(
             keys_deleted = 0
             keys_deleted += write_cdb.delete_keys([f"composerData:{cid}"])
             keys_deleted += write_cdb.delete_keys_by_prefix(f"bubbleId:{cid}:")
+            keys_deleted += write_cdb.delete_keys_by_prefix(
+                f"{db.CONV_HEADERS_PREFIX}{cid}:"
+            )
             keys_deleted += write_cdb.delete_keys_by_prefix(f"checkpointId:{cid}:")
             keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
             total_keys += keys_deleted
