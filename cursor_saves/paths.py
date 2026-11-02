@@ -1,5 +1,6 @@
 """Platform detection and Cursor storage path resolution."""
 
+import hashlib
 import json
 import os
 import platform
@@ -156,11 +157,42 @@ def _decode_ssh_host(host: str) -> str:
     return host
 
 
+def _uri_to_path(uri: str) -> Optional[str]:
+    """Return the filesystem path inside a workspace.json URI, or None."""
+    if uri.startswith("file://"):
+        return file_uri_to_path(uri)
+    if uri.startswith("vscode-remote://"):
+        # SSH remote workspace - extract the path portion
+        # Format: vscode-remote://ssh-remote%2B<host>/<path>
+        parts = uri.split("/", 3)
+        if len(parts) >= 4:
+            return "/" + parts[3]
+    return None
+
+
+def path_derived_workspace_id(project_path: str) -> Optional[str]:
+    """The storage id VS Code/Cursor derives from a path alone, or None.
+
+    The id of a ``.code-workspace`` file is the md5 of its path. Folder ids
+    also mix in file metadata (creation time), so they cannot be recomputed
+    and None is returned for them.
+    """
+    target = os.path.normpath(os.path.expanduser(project_path))
+    if not target.endswith(".code-workspace"):
+        return None
+    return hashlib.md5(target.encode()).hexdigest()
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
-    Scans workspace.json files in workspaceStorage/ to find matches.
-    Returns list of workspace directory paths, newest first.
+    Scans workspace.json files in workspaceStorage/ to find matches, for both
+    folders (``folder`` key) and ``.code-workspace`` files (``workspace`` key).
+
+    Returns a list, best first. Cursor sometimes keeps several storage
+    directories for one path (for example one using the id derived from the
+    path and one carrying an id from another machine). The directory whose
+    name is the path-derived id comes first; the rest are newest first.
     """
     ws_storage = get_workspace_storage_dir()
     if not ws_storage.exists():
@@ -178,28 +210,21 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
-            if folder_uri.startswith("file://"):
-                folder_path = file_uri_to_path(folder_uri)
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
-            else:
-                continue
-
-            if paths_equal(folder_path, target):
-                matches.append(ws_dir)
         except (json.JSONDecodeError, OSError):
             continue
+        for key in ("folder", "workspace"):
+            uri = data.get(key)
+            candidate = _uri_to_path(uri) if isinstance(uri, str) else None
+            if candidate is not None and paths_equal(candidate, target):
+                matches.append(ws_dir)
+                break
 
-    # Sort by modification time, newest first
-    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    preferred = path_derived_workspace_id(target)
+
+    def _rank(d: Path):
+        return (d.name != preferred, -d.stat().st_mtime)
+
+    matches.sort(key=_rank)
     return matches
 
 
